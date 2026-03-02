@@ -8,10 +8,23 @@ const MaxBatchSize = 2000
 // OpenAI has a 300,000 token limit. We use 280,000 for safety margin.
 const MaxBatchTokens = 280000
 
+// DefaultCharsPerToken is the default characters-per-token ratio for estimation.
+// Works well for OpenAI and most providers with English text.
+const DefaultCharsPerToken = 4
+
 // BatchLimits defines provider-specific batch constraints.
 type BatchLimits struct {
-	MaxSize   int // max inputs per batch
-	MaxTokens int // max tokens per batch
+	MaxSize       int // max inputs per batch
+	MaxTokens     int // max tokens per batch
+	CharsPerToken int // characters per token for estimation (0 = use DefaultCharsPerToken)
+}
+
+// charsPerToken returns the effective chars-per-token ratio.
+func (l BatchLimits) charsPerToken() int {
+	if l.CharsPerToken > 0 {
+		return l.CharsPerToken
+	}
+	return DefaultCharsPerToken
 }
 
 // DefaultBatchLimits are the limits used by OpenAI and other providers that don't declare their own.
@@ -19,11 +32,12 @@ var DefaultBatchLimits = BatchLimits{MaxSize: MaxBatchSize, MaxTokens: MaxBatchT
 
 // EstimateTokens estimates the token count for a text string.
 // Uses a conservative estimate of ~4 characters per token for English text.
-// This is intentionally conservative to avoid hitting API limits.
 func EstimateTokens(text string) int {
-	// Rough estimate: 1 token ≈ 4 characters for English text
-	// Use 3.5 to be more conservative
-	return (len(text) + 3) / 4 // Round up
+	return estimateTokensWithRatio(text, DefaultCharsPerToken)
+}
+
+func estimateTokensWithRatio(text string, charsPerToken int) int {
+	return (len(text) + charsPerToken - 1) / charsPerToken
 }
 
 // BatchEntry represents a single chunk with metadata for tracking its source.
@@ -132,9 +146,10 @@ func FormBatches(files []FileChunks, limits BatchLimits) []Batch {
 	estimatedBatches := (totalChunks + limits.MaxSize - 1) / limits.MaxSize
 	builder := newBatchBuilder(estimatedBatches, limits)
 
+	cpt := limits.charsPerToken()
 	for _, file := range files {
 		for chunkIdx, chunk := range file.Chunks {
-			tokens := EstimateTokens(chunk)
+			tokens := estimateTokensWithRatio(chunk, cpt)
 			if builder.isFull(tokens) {
 				builder.finalizeCurrent()
 			}

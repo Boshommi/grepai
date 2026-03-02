@@ -149,8 +149,11 @@ func TestVoyageAIEmbedder_BatchLimits(t *testing.T) {
 	if limits.MaxSize != 128 {
 		t.Errorf("expected BatchLimits().MaxSize = 128, got %d", limits.MaxSize)
 	}
-	if limits.MaxTokens != 100000 {
-		t.Errorf("expected BatchLimits().MaxTokens = 100000, got %d", limits.MaxTokens)
+	if limits.MaxTokens != 110000 {
+		t.Errorf("expected BatchLimits().MaxTokens = 110000, got %d", limits.MaxTokens)
+	}
+	if limits.CharsPerToken != 3 {
+		t.Errorf("expected BatchLimits().CharsPerToken = 3, got %d", limits.CharsPerToken)
 	}
 }
 
