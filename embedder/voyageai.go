@@ -183,9 +183,10 @@ func (e *VoyageAIEmbedder) Close() error {
 
 // BatchLimits returns Voyage AI-specific batch constraints.
 // Voyage AI has a 120,000 token limit per batch (we use 110,000 for safety margin).
-// Voyage's tokenizer averages ~3 chars/token for code, vs the default ~4.
+// Voyage's tokenizer averages ~2.4 chars/token for code (operators, brackets, short
+// identifiers each become separate tokens), so we use CharsPerToken: 2 for safety.
 func (e *VoyageAIEmbedder) BatchLimits() BatchLimits {
-	return BatchLimits{MaxSize: 128, MaxTokens: 110000, CharsPerToken: 3}
+	return BatchLimits{MaxSize: 128, MaxTokens: 110000, CharsPerToken: 2}
 }
 
 // EmbedBatches implements the BatchEmbedder interface.
