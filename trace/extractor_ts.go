@@ -15,7 +15,7 @@ import (
 	"github.com/smacker/go-tree-sitter/php"
 	"github.com/smacker/go-tree-sitter/python"
 	"github.com/smacker/go-tree-sitter/typescript/typescript"
-	"github.com/yoanbernabeu/grepai/fsharp"
+	"github.com/Boshommi/grepai/fsharp"
 )
 
 // TreeSitterExtractor implements SymbolExtractor using tree-sitter AST parsing.

@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/alpkeskin/gotoon"
-	"github.com/yoanbernabeu/grepai/rpg"
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/rpg"
+	"github.com/Boshommi/grepai/store"
 )
 
 func TestOutputSearchJSON(t *testing.T) {

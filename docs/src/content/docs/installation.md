@@ -29,7 +29,7 @@ Recommended for Linux, alternative for macOS:
 curl -sSL https://raw.githubusercontent.com/yoanbernabeu/grepai/main/install.sh | sh
 ```
 
-Or download directly from [Releases](https://github.com/yoanbernabeu/grepai/releases).
+Or download directly from [Releases](https://github.com/Boshommi/grepai/releases).
 
 ## Windows (PowerShell)
 
@@ -45,7 +45,7 @@ Requires **Go 1.24+**.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yoanbernabeu/grepai.git
+git clone https://github.com/Boshommi/grepai.git
 cd grepai
 
 # Build the binary

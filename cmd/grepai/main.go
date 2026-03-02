@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/yoanbernabeu/grepai/cli"
+	"github.com/Boshommi/grepai/cli"
 )
 
 var version = "dev"

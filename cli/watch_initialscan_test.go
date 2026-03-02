@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/indexer"
-	"github.com/yoanbernabeu/grepai/store"
-	"github.com/yoanbernabeu/grepai/trace"
-	"github.com/yoanbernabeu/grepai/watcher"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/indexer"
+	"github.com/Boshommi/grepai/store"
+	"github.com/Boshommi/grepai/trace"
+	"github.com/Boshommi/grepai/watcher"
 )
 
 type noOpEmbedder struct{}

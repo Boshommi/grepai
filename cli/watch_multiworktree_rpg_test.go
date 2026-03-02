@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/rpg"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/rpg"
 )
 
 type stubEmbedder struct {

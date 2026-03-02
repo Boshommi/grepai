@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/daemon"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/daemon"
 )
 
 const watchLogDirHintFileName = "watch-log-dir"

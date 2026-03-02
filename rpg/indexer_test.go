@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/store"
-	"github.com/yoanbernabeu/grepai/trace"
+	"github.com/Boshommi/grepai/store"
+	"github.com/Boshommi/grepai/trace"
 )
 
 type countingFeatureExtractor struct {

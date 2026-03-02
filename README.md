@@ -6,10 +6,10 @@
 
 [![Product Hunt](https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1067661&theme=light)](https://www.producthunt.com/products/grepai)
 
-[![GitHub stars](https://img.shields.io/github/stars/yoanbernabeu/grepai?style=flat&logo=github)](https://github.com/yoanbernabeu/grepai/stargazers)
-[![Downloads](https://img.shields.io/github/downloads/yoanbernabeu/grepai/total?style=flat&logo=github)](https://github.com/yoanbernabeu/grepai/releases)
-[![Go](https://github.com/yoanbernabeu/grepai/actions/workflows/ci.yml/badge.svg)](https://github.com/yoanbernabeu/grepai/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yoanbernabeu/grepai)](https://goreportcard.com/report/github.com/yoanbernabeu/grepai)
+[![GitHub stars](https://img.shields.io/github/stars/yoanbernabeu/grepai?style=flat&logo=github)](https://github.com/Boshommi/grepai/stargazers)
+[![Downloads](https://img.shields.io/github/downloads/yoanbernabeu/grepai/total?style=flat&logo=github)](https://github.com/Boshommi/grepai/releases)
+[![Go](https://github.com/Boshommi/grepai/actions/workflows/ci.yml/badge.svg)](https://github.com/Boshommi/grepai/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Boshommi/grepai)](https://goreportcard.com/report/github.com/Boshommi/grepai)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Search code by meaning, not just text.**

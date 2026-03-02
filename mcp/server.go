@@ -17,12 +17,12 @@ import (
 	"github.com/alpkeskin/gotoon"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/embedder"
-	"github.com/yoanbernabeu/grepai/rpg"
-	"github.com/yoanbernabeu/grepai/search"
-	"github.com/yoanbernabeu/grepai/store"
-	"github.com/yoanbernabeu/grepai/trace"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/embedder"
+	"github.com/Boshommi/grepai/rpg"
+	"github.com/Boshommi/grepai/search"
+	"github.com/Boshommi/grepai/store"
+	"github.com/Boshommi/grepai/trace"
 )
 
 // Server wraps the MCP server with grepai functionality.

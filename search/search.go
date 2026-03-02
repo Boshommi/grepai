@@ -3,9 +3,9 @@ package search
 import (
 	"context"
 
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/embedder"
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/embedder"
+	"github.com/Boshommi/grepai/store"
 )
 
 type Searcher struct {

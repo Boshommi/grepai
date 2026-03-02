@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/embedder"
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/embedder"
+	"github.com/Boshommi/grepai/store"
 )
 
 type Indexer struct {
@@ -401,7 +401,11 @@ func (idx *Indexer) indexFilesBatched(
 
 	// Embed remaining (non-cached) files
 	if len(remainingFileChunks) > 0 {
-		batches := embedder.FormBatches(remainingFileChunks)
+		limits := embedder.DefaultBatchLimits
+		if bl, ok := batchEmb.(embedder.BatchLimiter); ok {
+			limits = bl.BatchLimits()
+		}
+		batches := embedder.FormBatches(remainingFileChunks, limits)
 		results, err := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress))
 		if err != nil {
 			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", err)

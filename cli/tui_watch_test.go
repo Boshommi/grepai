@@ -7,8 +7,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/store"
 )
 
 func TestWatchUIModelLifecycleTransition(t *testing.T) {

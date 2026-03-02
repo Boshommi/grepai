@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/trace"
+	"github.com/Boshommi/grepai/trace"
 )
 
 func TestTraceEmptyState_NoSymbolMatch(t *testing.T) {

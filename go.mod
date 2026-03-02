@@ -1,4 +1,4 @@
-module github.com/yoanbernabeu/grepai
+module github.com/Boshommi/grepai
 
 go 1.24.2
 

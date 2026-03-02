@@ -168,6 +168,6 @@ The agent will automatically use the relevant skills to provide accurate guidanc
 
 ## Resources
 
-- **Skills Repository**: [github.com/yoanbernabeu/grepai-skills](https://github.com/yoanbernabeu/grepai-skills) — Contributions welcome!
+- **Skills Repository**: [github.com/Boshommi/grepai-skills](https://github.com/Boshommi/grepai-skills) — Contributions welcome!
 - **Skills CLI**: [github.com/vercel-labs/skills](https://github.com/vercel-labs/skills) — The open agent skills tool
 - **Skills Directory**: [skills.sh](https://skills.sh) — Browse all available skills

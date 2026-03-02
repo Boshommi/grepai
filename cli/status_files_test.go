@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/store"
 )
 
 func TestLoadStatusFiles_SkipsWhenUIOff(t *testing.T) {

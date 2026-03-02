@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/store"
 )
 
 // TextSearch performs a simple text-based search on chunks.

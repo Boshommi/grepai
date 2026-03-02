@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/store"
 )
 
 func createGoFixtureFiles(tb testing.TB, root string, fileCount int) {

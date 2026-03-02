@@ -27,7 +27,7 @@ If you haven't tried grepai yet, check out our [Getting Started guide](/grepai/g
 
 ## Stay Connected
 
-- Star us on [GitHub](https://github.com/yoanbernabeu/grepai)
+- Star us on [GitHub](https://github.com/Boshommi/grepai)
 - Follow the [documentation](/grepai/getting-started/) for detailed guides
 - Contribute to the project - we welcome PRs!
 

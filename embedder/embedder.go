@@ -23,6 +23,12 @@ type Embedder interface {
 // statusCode is the HTTP status code when retrying (429 = rate limited, 5xx = server error).
 type BatchProgress func(batchIndex, totalBatches, completedChunks, totalChunks int, retrying bool, attempt int, statusCode int)
 
+// BatchLimiter is optionally implemented by BatchEmbedder providers that have
+// non-default batch limits. Providers that don't implement this get DefaultBatchLimits.
+type BatchLimiter interface {
+	BatchLimits() BatchLimits
+}
+
 // BatchEmbedder extends Embedder with cross-file batch embedding capabilities.
 // Providers that support advanced batching (like OpenAI) implement this interface
 // to enable parallel processing of multiple batches.

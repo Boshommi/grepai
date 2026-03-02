@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/daemon"
-	"github.com/yoanbernabeu/grepai/indexer"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/daemon"
+	"github.com/Boshommi/grepai/indexer"
 )
 
 func withWatchGlobals(t *testing.T, workspace string, status, stop, background bool) {

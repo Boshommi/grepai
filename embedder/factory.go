@@ -3,7 +3,7 @@ package embedder
 import (
 	"fmt"
 
-	"github.com/yoanbernabeu/grepai/config"
+	"github.com/Boshommi/grepai/config"
 )
 
 // NewFromConfig creates an Embedder based on the provided configuration.
@@ -64,6 +64,17 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 			opts = append(opts, WithOpenRouterDimensions(*cfg.Embedder.Dimensions))
 		}
 		return NewOpenRouterEmbedder(opts...)
+
+	case "voyageai":
+		opts := []VoyageAIOption{
+			WithVoyageAIModel(cfg.Embedder.Model),
+			WithVoyageAIKey(cfg.Embedder.APIKey),
+			WithVoyageAIEndpoint(cfg.Embedder.Endpoint),
+		}
+		if cfg.Embedder.Dimensions != nil {
+			opts = append(opts, WithVoyageAIDimensions(*cfg.Embedder.Dimensions))
+		}
+		return NewVoyageAIEmbedder(opts...)
 
 	default:
 		return nil, fmt.Errorf("unknown embedding provider: %s", cfg.Embedder.Provider)

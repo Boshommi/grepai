@@ -7,8 +7,8 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/git"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/git"
 )
 
 type initWizardStep int

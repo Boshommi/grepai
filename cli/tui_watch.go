@@ -15,9 +15,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/indexer"
-	"github.com/yoanbernabeu/grepai/watcher"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/indexer"
+	"github.com/Boshommi/grepai/watcher"
 )
 
 const (

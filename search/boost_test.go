@@ -3,8 +3,8 @@ package search
 import (
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/store"
 )
 
 func TestApplyBoost_Disabled(t *testing.T) {

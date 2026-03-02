@@ -81,7 +81,7 @@ func (u *Updater) CheckForUpdate(ctx context.Context) (*CheckResult, error) {
 		CurrentVersion:  u.currentVersion,
 		LatestVersion:   release.TagName,
 		UpdateAvailable: latestVersion != currentVersion && currentVersion != "dev",
-		ReleaseURL:      fmt.Sprintf("https://github.com/yoanbernabeu/grepai/releases/tag/%s", release.TagName),
+		ReleaseURL:      fmt.Sprintf("https://github.com/Boshommi/grepai/releases/tag/%s", release.TagName),
 		PublishedAt:     release.PublishedAt,
 	}, nil
 }

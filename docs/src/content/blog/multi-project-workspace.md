@@ -279,6 +279,6 @@ Workspaces require a **shared vector store backend**:
 
 - Try creating a workspace with your existing projects
 - [Read the full documentation](/grepai/workspace/)
-- Join the discussion on [GitHub](https://github.com/yoanbernabeu/grepai)
+- Join the discussion on [GitHub](https://github.com/Boshommi/grepai)
 
 Happy searching across your stack!

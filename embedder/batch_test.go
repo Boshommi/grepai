@@ -45,12 +45,12 @@ func TestBatchContents(t *testing.T) {
 
 func TestFormBatches_EmptyInput(t *testing.T) {
 	// Empty files slice
-	batches := FormBatches(nil)
+	batches := FormBatches(nil, DefaultBatchLimits)
 	if batches != nil {
 		t.Errorf("expected nil batches for nil input, got %v", batches)
 	}
 
-	batches = FormBatches([]FileChunks{})
+	batches = FormBatches([]FileChunks{}, DefaultBatchLimits)
 	if batches != nil {
 		t.Errorf("expected nil batches for empty input, got %v", batches)
 	}
@@ -59,7 +59,7 @@ func TestFormBatches_EmptyInput(t *testing.T) {
 	batches = FormBatches([]FileChunks{
 		{FileIndex: 0, Chunks: []string{}},
 		{FileIndex: 1, Chunks: nil},
-	})
+	}, DefaultBatchLimits)
 	if batches != nil {
 		t.Errorf("expected nil batches for files with no chunks, got %v", batches)
 	}
@@ -70,7 +70,7 @@ func TestFormBatches_SingleFileFewChunks(t *testing.T) {
 		{FileIndex: 0, Chunks: []string{"chunk1", "chunk2", "chunk3"}},
 	}
 
-	batches := FormBatches(files)
+	batches := FormBatches(files, DefaultBatchLimits)
 
 	if len(batches) != 1 {
 		t.Fatalf("expected 1 batch, got %d", len(batches))
@@ -106,7 +106,7 @@ func TestFormBatches_SingleFileManyChunks(t *testing.T) {
 		{FileIndex: 0, Chunks: chunks},
 	}
 
-	batches := FormBatches(files)
+	batches := FormBatches(files, DefaultBatchLimits)
 
 	if len(batches) != 2 {
 		t.Fatalf("expected 2 batches for %d chunks, got %d", len(chunks), len(batches))
@@ -149,7 +149,7 @@ func TestFormBatches_MultipleFilesCombined(t *testing.T) {
 		{FileIndex: 2, Chunks: []string{"file2-chunk0"}},
 	}
 
-	batches := FormBatches(files)
+	batches := FormBatches(files, DefaultBatchLimits)
 
 	if len(batches) != 1 {
 		t.Fatalf("expected 1 batch, got %d", len(batches))
@@ -204,7 +204,7 @@ func TestFormBatches_MultipleFilesBatchBoundary(t *testing.T) {
 		{FileIndex: 1, Chunks: file2Chunks},
 	}
 
-	batches := FormBatches(files)
+	batches := FormBatches(files, DefaultBatchLimits)
 
 	if len(batches) != 2 {
 		t.Fatalf("expected 2 batches, got %d", len(batches))
@@ -256,7 +256,7 @@ func TestFormBatches_ExactlyMaxBatchSize(t *testing.T) {
 		{FileIndex: 0, Chunks: chunks},
 	}
 
-	batches := FormBatches(files)
+	batches := FormBatches(files, DefaultBatchLimits)
 
 	if len(batches) != 1 {
 		t.Errorf("expected 1 batch for exactly %d chunks, got %d", MaxBatchSize, len(batches))
@@ -276,7 +276,7 @@ func TestFormBatches_ExactlyMaxBatchSizePlusOne(t *testing.T) {
 		{FileIndex: 0, Chunks: chunks},
 	}
 
-	batches := FormBatches(files)
+	batches := FormBatches(files, DefaultBatchLimits)
 
 	if len(batches) != 2 {
 		t.Errorf("expected 2 batches for %d chunks, got %d", MaxBatchSize+1, len(batches))
@@ -422,7 +422,7 @@ func TestFormBatches_TokenLimit(t *testing.T) {
 		{FileIndex: 0, Chunks: chunks},
 	}
 
-	batches := FormBatches(files)
+	batches := FormBatches(files, DefaultBatchLimits)
 
 	// Should have more than 1 batch due to token limit (even though count is below MaxBatchSize)
 	if len(batches) < 2 {
@@ -463,7 +463,7 @@ func TestFormBatches_SmallChunksIgnoreTokenLimit(t *testing.T) {
 		{FileIndex: 0, Chunks: chunks},
 	}
 
-	batches := FormBatches(files)
+	batches := FormBatches(files, DefaultBatchLimits)
 
 	// Should be split by count, not tokens
 	if len(batches) != 2 {
@@ -473,5 +473,45 @@ func TestFormBatches_SmallChunksIgnoreTokenLimit(t *testing.T) {
 	// First batch should be exactly MaxBatchSize
 	if len(batches[0].Entries) != MaxBatchSize {
 		t.Errorf("first batch should have %d entries, got %d", MaxBatchSize, len(batches[0].Entries))
+	}
+}
+
+func TestFormBatches_CustomLimits(t *testing.T) {
+	limits := BatchLimits{MaxSize: 3, MaxTokens: 100}
+
+	files := []FileChunks{
+		{FileIndex: 0, Chunks: []string{"a", "b", "c", "d", "e"}},
+	}
+
+	batches := FormBatches(files, limits)
+
+	// 5 chunks with MaxSize=3 should produce 2 batches: [3, 2]
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches with custom limits, got %d", len(batches))
+	}
+	if len(batches[0].Entries) != 3 {
+		t.Errorf("first batch should have 3 entries, got %d", len(batches[0].Entries))
+	}
+	if len(batches[1].Entries) != 2 {
+		t.Errorf("second batch should have 2 entries, got %d", len(batches[1].Entries))
+	}
+
+	// Test token limit: each chunk ~2500 tokens, limit 5000 -> max 2 per batch
+	largeChunk := string(make([]byte, 10000)) // ~2500 tokens
+	largeFiles := []FileChunks{
+		{FileIndex: 0, Chunks: []string{largeChunk, largeChunk, largeChunk}},
+	}
+	tokenLimits := BatchLimits{MaxSize: 1000, MaxTokens: 5000}
+
+	batches = FormBatches(largeFiles, tokenLimits)
+
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches with token limits, got %d", len(batches))
+	}
+	if len(batches[0].Entries) != 2 {
+		t.Errorf("first batch should have 2 entries, got %d", len(batches[0].Entries))
+	}
+	if len(batches[1].Entries) != 1 {
+		t.Errorf("second batch should have 1 entry, got %d", len(batches[1].Entries))
 	}
 }

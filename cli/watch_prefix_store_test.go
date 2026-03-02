@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/store"
 )
 
 type mockVectorStore struct {

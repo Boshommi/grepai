@@ -20,7 +20,7 @@ Thank you for your interest in contributing to grepai! This document provides gu
    ```
 3. Add the upstream remote:
    ```bash
-   git remote add upstream https://github.com/yoanbernabeu/grepai.git
+   git remote add upstream https://github.com/Boshommi/grepai.git
    ```
 4. Install dependencies:
    ```bash

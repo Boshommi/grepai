@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/config"
+	"github.com/Boshommi/grepai/config"
 )
 
 func TestResolveMCPWorkspace(t *testing.T) {

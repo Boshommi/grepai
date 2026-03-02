@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/config"
+	"github.com/Boshommi/grepai/config"
 )
 
 func TestRunWorkspaceStatus_UINamedWorkspaceStillValidatesName(t *testing.T) {

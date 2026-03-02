@@ -8,6 +8,15 @@ const MaxBatchSize = 2000
 // OpenAI has a 300,000 token limit. We use 280,000 for safety margin.
 const MaxBatchTokens = 280000
 
+// BatchLimits defines provider-specific batch constraints.
+type BatchLimits struct {
+	MaxSize   int // max inputs per batch
+	MaxTokens int // max tokens per batch
+}
+
+// DefaultBatchLimits are the limits used by OpenAI and other providers that don't declare their own.
+var DefaultBatchLimits = BatchLimits{MaxSize: MaxBatchSize, MaxTokens: MaxBatchTokens}
+
 // EstimateTokens estimates the token count for a text string.
 // Uses a conservative estimate of ~4 characters per token for English text.
 // This is intentionally conservative to avoid hitting API limits.
@@ -62,23 +71,25 @@ type batchBuilder struct {
 	batches       []Batch
 	current       Batch
 	currentTokens int
+	limits        BatchLimits
 }
 
-func newBatchBuilder(estimatedBatches int) *batchBuilder {
+func newBatchBuilder(estimatedBatches int, limits BatchLimits) *batchBuilder {
 	return &batchBuilder{
 		batches: make([]Batch, 0, estimatedBatches),
 		current: Batch{
 			Index:   0,
-			Entries: make([]BatchEntry, 0, MaxBatchSize),
+			Entries: make([]BatchEntry, 0, limits.MaxSize),
 		},
+		limits: limits,
 	}
 }
 
 func (b *batchBuilder) isFull(additionalTokens int) bool {
-	if len(b.current.Entries) >= MaxBatchSize {
+	if len(b.current.Entries) >= b.limits.MaxSize {
 		return true
 	}
-	if len(b.current.Entries) > 0 && b.currentTokens+additionalTokens > MaxBatchTokens {
+	if len(b.current.Entries) > 0 && b.currentTokens+additionalTokens > b.limits.MaxTokens {
 		return true
 	}
 	return false
@@ -88,7 +99,7 @@ func (b *batchBuilder) finalizeCurrent() {
 	b.batches = append(b.batches, b.current)
 	b.current = Batch{
 		Index:   len(b.batches),
-		Entries: make([]BatchEntry, 0, MaxBatchSize),
+		Entries: make([]BatchEntry, 0, b.limits.MaxSize),
 	}
 	b.currentTokens = 0
 }
@@ -110,16 +121,16 @@ func (b *batchBuilder) build() []Batch {
 }
 
 // FormBatches splits chunks from multiple files into batches respecting both
-// MaxBatchSize (input count) and MaxBatchTokens (token limit).
+// size (input count) and token limits from the provided BatchLimits.
 // Chunks maintain their file/chunk index tracking for result mapping.
-func FormBatches(files []FileChunks) []Batch {
+func FormBatches(files []FileChunks, limits BatchLimits) []Batch {
 	totalChunks := countTotalChunks(files)
 	if totalChunks == 0 {
 		return nil
 	}
 
-	estimatedBatches := (totalChunks + MaxBatchSize - 1) / MaxBatchSize
-	builder := newBatchBuilder(estimatedBatches)
+	estimatedBatches := (totalChunks + limits.MaxSize - 1) / limits.MaxSize
+	builder := newBatchBuilder(estimatedBatches, limits)
 
 	for _, file := range files {
 		for chunkIdx, chunk := range file.Chunks {

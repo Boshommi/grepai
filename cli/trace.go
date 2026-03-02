@@ -9,9 +9,9 @@ import (
 
 	"github.com/alpkeskin/gotoon"
 	"github.com/spf13/cobra"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/rpg"
-	"github.com/yoanbernabeu/grepai/trace"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/rpg"
+	"github.com/Boshommi/grepai/trace"
 )
 
 var (

@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/trace"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/trace"
 )
 
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)

@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/yoanbernabeu/grepai/config"
+	"github.com/Boshommi/grepai/config"
 )
 
 // TestDiscoveryToolsCompile verifies that the discovery tools are properly integrated

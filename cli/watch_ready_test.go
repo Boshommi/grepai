@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/Boshommi/grepai/embedder"
 	"golang.org/x/sync/errgroup"
 )
 

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/embedder"
-	"github.com/yoanbernabeu/grepai/indexer"
+	"github.com/Boshommi/grepai/embedder"
+	"github.com/Boshommi/grepai/indexer"
 )
 
 type watchLifecycleEvent struct {

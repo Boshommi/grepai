@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/yoanbernabeu/grepai/updater"
+	"github.com/Boshommi/grepai/updater"
 )
 
 var (

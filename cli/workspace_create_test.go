@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/config"
+	"github.com/Boshommi/grepai/config"
 )
 
 func setTestHomeDirCLI(t *testing.T, dir string) func() {

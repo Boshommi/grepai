@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/embedder"
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/embedder"
+	"github.com/Boshommi/grepai/store"
 )
 
 // mockStore implements store.VectorStore for testing

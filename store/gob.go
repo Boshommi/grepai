@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/internal/fileutil"
+	"github.com/Boshommi/grepai/internal/fileutil"
 )
 
 type GOBStore struct {

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/yoanbernabeu/grepai/indexer"
+	"github.com/Boshommi/grepai/indexer"
 )
 
 type EventType int

@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/mcp"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/mcp"
 )
 
 var mcpServeCmd = &cobra.Command{

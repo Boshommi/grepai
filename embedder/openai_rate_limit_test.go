@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/Boshommi/grepai/embedder"
 )
 
 // TestOpenAIEmbedder_RetryAfterHeader tests that the Retry-After header is respected.

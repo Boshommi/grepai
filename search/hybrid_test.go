@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/yoanbernabeu/grepai/store"
+	"github.com/Boshommi/grepai/store"
 )
 
 func TestTextSearch(t *testing.T) {

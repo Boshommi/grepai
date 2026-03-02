@@ -27,7 +27,7 @@
 
         meta = with pkgs.lib; {
           description = "AI-powered semantic code search tool";
-          homepage = "https://github.com/yoanbernabeu/grepai";
+          homepage = "https://github.com/Boshommi/grepai";
           license = licenses.mit;
           mainProgram = "grepai";
         };

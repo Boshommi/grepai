@@ -73,8 +73,8 @@ Add new section after `## [Unreleased]`:
 Update comparison links at bottom:
 
 ```markdown
-[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/vX.Y.Z...HEAD
-[X.Y.Z]: https://github.com/yoanbernabeu/grepai/compare/vPREVIOUS...vX.Y.Z
+[Unreleased]: https://github.com/Boshommi/grepai/compare/vX.Y.Z...HEAD
+[X.Y.Z]: https://github.com/Boshommi/grepai/compare/vPREVIOUS...vX.Y.Z
 ```
 
 #### 4.2 Documentation Hero

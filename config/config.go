@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yoanbernabeu/grepai/git"
+	"github.com/Boshommi/grepai/git"
 	"gopkg.in/yaml.v3"
 )
 
@@ -30,9 +30,13 @@ const (
 	DefaultOpenAIEndpoint     = "https://api.openai.com/v1"
 	DefaultSyntheticEndpoint  = "https://api.synthetic.new/openai/v1"
 	DefaultOpenRouterEndpoint = "https://openrouter.ai/api/v1"
+	DefaultVoyageAIEndpoint   = "https://api.voyageai.com/v1"
+
+	DefaultVoyageAIEmbeddingModel = "voyage-code-3"
 
 	DefaultLocalEmbeddingDimensions = 768
 	DefaultOpenAIDimensions         = 1536
+	DefaultVoyageAIDimensions       = 1024
 
 	DefaultPostgresDSN    = "postgres://localhost:5432/grepai"
 	DefaultQdrantEndpoint = "localhost"
@@ -93,7 +97,7 @@ type BoostRule struct {
 }
 
 type EmbedderConfig struct {
-	Provider    string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter
+	Provider    string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter | voyageai
 	Model       string `yaml:"model"`
 	Endpoint    string `yaml:"endpoint,omitempty"`
 	APIKey      string `yaml:"api_key,omitempty"`
@@ -111,6 +115,8 @@ func (e *EmbedderConfig) GetDimensions() int {
 	switch e.Provider {
 	case "openai", "openrouter":
 		return DefaultOpenAIDimensions
+	case "voyageai":
+		return DefaultVoyageAIDimensions
 	default:
 		return DefaultLocalEmbeddingDimensions
 	}
@@ -131,6 +137,13 @@ func DefaultEmbedderForProvider(provider string) EmbedderConfig {
 			Provider:   "openrouter",
 			Model:      DefaultOpenRouterEmbeddingModel,
 			Endpoint:   DefaultOpenRouterEndpoint,
+			Dimensions: nil,
+		}
+	case "voyageai":
+		return EmbedderConfig{
+			Provider:   "voyageai",
+			Model:      DefaultVoyageAIEmbeddingModel,
+			Endpoint:   DefaultVoyageAIEndpoint,
 			Dimensions: nil,
 		}
 	case "lmstudio":

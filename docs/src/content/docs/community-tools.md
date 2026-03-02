@@ -67,7 +67,7 @@ Have you built something useful for the grepai community? We'd love to showcase 
 
 **How to add your tool:**
 
-1. Fork the [grepai repository](https://github.com/yoanbernabeu/grepai)
+1. Fork the [grepai repository](https://github.com/Boshommi/grepai)
 2. Add your tool to this page (`docs/src/content/docs/community-tools.md`)
 3. Include: description, installation, use cases, repository link
 4. Open a pull request with clear description
@@ -80,4 +80,4 @@ Have you built something useful for the grepai community? We'd love to showcase 
 - Link to well-documented repositories
 - Maintain your tool (respond to issues, keep updated)
 
-Questions? Open an issue or discussion in the [grepai repository](https://github.com/yoanbernabeu/grepai).
+Questions? Open an issue or discussion in the [grepai repository](https://github.com/Boshommi/grepai).

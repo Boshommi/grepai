@@ -9,9 +9,9 @@ import (
 	"testing"
 
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/store"
-	"github.com/yoanbernabeu/grepai/trace"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/store"
+	"github.com/Boshommi/grepai/trace"
 )
 
 // TestServerCreateEmbedder_AppliesConfiguredDimensions verifies that createEmbedder

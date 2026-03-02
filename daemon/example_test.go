@@ -5,7 +5,7 @@ import (
 	"log"
 	"path/filepath"
 
-	"github.com/yoanbernabeu/grepai/daemon"
+	"github.com/Boshommi/grepai/daemon"
 )
 
 // ExampleGetDefaultLogDir demonstrates how to get the OS-specific default log directory.

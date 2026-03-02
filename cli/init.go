@@ -7,9 +7,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/yoanbernabeu/grepai/config"
-	"github.com/yoanbernabeu/grepai/git"
-	"github.com/yoanbernabeu/grepai/indexer"
+	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/git"
+	"github.com/Boshommi/grepai/indexer"
 )
 
 var (
@@ -39,7 +39,7 @@ This command will:
 }
 
 func init() {
-	initCmd.Flags().StringVarP(&initProvider, "provider", "p", "", "Embedding provider (ollama, lmstudio, openai, synthetic, or openrouter)")
+	initCmd.Flags().StringVarP(&initProvider, "provider", "p", "", "Embedding provider (ollama, lmstudio, openai, synthetic, openrouter, or voyageai)")
 	initCmd.Flags().StringVarP(&initModel, "model", "m", "", "Embedding model (for openrouter: text-embedding-3-small, text-embedding-3-large, qwen3-embedding-8b)")
 	initCmd.Flags().StringVarP(&initBackend, "backend", "b", "", "Storage backend (gob, postgres, or qdrant)")
 	initCmd.Flags().BoolVar(&initNonInteractive, "yes", false, "Use defaults without prompting")
@@ -123,6 +123,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Println("  3) openai (cloud, requires API key)")
 			fmt.Println("  4) synthetic (cloud, free embedding API)")
 			fmt.Println("  5) openrouter (cloud, multi-provider gateway)")
+			fmt.Println("  6) voyageai (cloud, best-in-class code embeddings)")
 			fmt.Print("Choice [1]: ")
 
 			input, _ := reader.ReadString('\n')
@@ -175,6 +176,32 @@ func runInit(cmd *cobra.Command, args []string) error {
 				default:
 					cfg.Embedder.Model = "openai/text-embedding-3-small"
 				}
+			case "6", "voyageai":
+				cfg.Embedder.Provider = "voyageai"
+				cfg.Embedder.Endpoint = "https://api.voyageai.com/v1"
+				// VoyageAI: leave Dimensions nil to use model's native dimensions
+
+				// Model selection for Voyage AI
+				fmt.Println("\nSelect Voyage AI embedding model:")
+				fmt.Println("  1) voyage-code-3 (optimized for code, recommended)")
+				fmt.Println("  2) voyage-4-large (best general quality)")
+				fmt.Println("  3) voyage-4 (balanced quality/speed)")
+				fmt.Println("  4) voyage-4-lite (fastest/cheapest)")
+				fmt.Print("Choice [1]: ")
+
+				modelInput, _ := reader.ReadString('\n')
+				modelInput = strings.TrimSpace(modelInput)
+
+				switch modelInput {
+				case "2":
+					cfg.Embedder.Model = "voyage-4-large"
+				case "3":
+					cfg.Embedder.Model = "voyage-4"
+				case "4":
+					cfg.Embedder.Model = "voyage-4-lite"
+				default:
+					cfg.Embedder.Model = "voyage-code-3"
+				}
 			default:
 				cfg.Embedder.Provider = "ollama"
 				fmt.Print("Ollama endpoint [http://localhost:11434]: ")
@@ -206,6 +233,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 				cfg.Embedder.Model = "openai/text-embedding-3-small"
 				cfg.Embedder.Endpoint = "https://openrouter.ai/api/v1"
 				// OpenRouter: leave Dimensions nil to use model's native dimensions
+			case "voyageai":
+				cfg.Embedder.Model = "voyage-code-3"
+				cfg.Embedder.Endpoint = "https://api.voyageai.com/v1"
+				// VoyageAI: leave Dimensions nil to use model's native dimensions
 			}
 		}
 
@@ -300,6 +331,20 @@ func runInit(cmd *cobra.Command, args []string) error {
 				default:
 					cfg.Embedder.Model = "openai/text-embedding-3-small"
 				}
+			case "voyageai":
+				cfg.Embedder.Endpoint = "https://api.voyageai.com/v1"
+				cfg.Embedder.Dimensions = nil
+				// Use provided model flag or default
+				switch initModel {
+				case "voyage-4-large":
+					cfg.Embedder.Model = "voyage-4-large"
+				case "voyage-4":
+					cfg.Embedder.Model = "voyage-4"
+				case "voyage-4-lite":
+					cfg.Embedder.Model = "voyage-4-lite"
+				default:
+					cfg.Embedder.Model = "voyage-code-3"
+				}
 			}
 		}
 		if initBackend != "" {
@@ -345,6 +390,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 	case "openrouter":
 		fmt.Println("\nMake sure OPENROUTER_API_KEY or OPENAI_API_KEY is set in your environment.")
 		fmt.Println("  Get your API key at: https://openrouter.ai/keys")
+	case "voyageai":
+		fmt.Println("\nMake sure VOYAGE_API_KEY is set in your environment.")
+		fmt.Println("  Get your API key at: https://dash.voyageai.com/api-keys")
 	}
 
 	return nil

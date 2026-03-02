@@ -12,7 +12,7 @@ tags:
 
 ## TL;DR
 
-We're releasing **[grepai-skills](https://github.com/yoanbernabeu/grepai-skills)**, a collection of 27 ready-to-use skills that teach your AI coding agent how to leverage grepai effectively. This open-source project lives in its own dedicated repository. One command installs everything:
+We're releasing **[grepai-skills](https://github.com/Boshommi/grepai-skills)**, a collection of 27 ready-to-use skills that teach your AI coding agent how to leverage grepai effectively. This open-source project lives in its own dedicated repository. One command installs everything:
 
 ```bash
 npx skills add yoanbernabeu/grepai-skills
@@ -142,5 +142,5 @@ The skills take care of the rest.
 
 **Resources:**
 - [Skills Documentation](/grepai/skills/)
-- [grepai-skills Repository](https://github.com/yoanbernabeu/grepai-skills)
+- [grepai-skills Repository](https://github.com/Boshommi/grepai-skills)
 - [Skills Ecosystem](https://skills.sh)

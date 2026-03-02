@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra/doc"
-	"github.com/yoanbernabeu/grepai/cli"
+	"github.com/Boshommi/grepai/cli"
 )
 
 func main() {
