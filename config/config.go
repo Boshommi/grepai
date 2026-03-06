@@ -102,7 +102,7 @@ type EmbedderConfig struct {
 	Endpoint    string `yaml:"endpoint,omitempty"`
 	APIKey      string `yaml:"api_key,omitempty"`
 	Dimensions  *int   `yaml:"dimensions,omitempty"`
-	Parallelism int    `yaml:"parallelism"` // Number of parallel workers for batch embedding (default: 4)
+	Parallelism int    `yaml:"parallelism"` // Max concurrent embedding requests for supporting providers (default: 4)
 }
 
 // GetDimensions returns the configured dimensions or a default value.
@@ -461,7 +461,7 @@ func (c *Config) applyDefaults() {
 		}
 	}
 
-	// Parallelism default (only used by OpenAI embedder)
+	// Parallelism default for embedders that support concurrent requests.
 	if c.Embedder.Parallelism <= 0 {
 		c.Embedder.Parallelism = 4
 	}

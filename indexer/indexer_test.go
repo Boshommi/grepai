@@ -16,8 +16,10 @@ import (
 
 // mockStore implements store.VectorStore for testing
 type mockStore struct {
+	mu               sync.Mutex
 	documents        map[string]store.Document
 	chunks           map[string]store.Chunk
+	cachedVectors    map[string][]float32
 	listFilesStats   []store.FileStats
 	listSnapshots    []store.DocumentSnapshot
 	listDocsCalled   bool
@@ -27,16 +29,26 @@ type mockStore struct {
 	saveChunksCalled bool
 	delByFileCalled  bool
 	delDocCalled     bool
+	lookupByHashCalls int
+	bulkLookupCalls   int
+	bulkLookupInputs  [][]string
+	deleteDelay       time.Duration
+	deleteBlock       <-chan struct{}
+	deleteActive      atomic.Int32
+	deleteMaxActive   atomic.Int32
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		documents: make(map[string]store.Document),
-		chunks:    make(map[string]store.Chunk),
+		documents:     make(map[string]store.Document),
+		chunks:        make(map[string]store.Chunk),
+		cachedVectors: make(map[string][]float32),
 	}
 }
 
 func (m *mockStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.saveChunksCalled = true
 	for _, chunk := range chunks {
 		m.chunks[chunk.ID] = chunk
@@ -45,6 +57,31 @@ func (m *mockStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error 
 }
 
 func (m *mockStore) DeleteByFile(ctx context.Context, filePath string) error {
+	active := m.deleteActive.Add(1)
+	for {
+		currentMax := m.deleteMaxActive.Load()
+		if active <= currentMax || m.deleteMaxActive.CompareAndSwap(currentMax, active) {
+			break
+		}
+	}
+	defer m.deleteActive.Add(-1)
+
+	if m.deleteBlock != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-m.deleteBlock:
+		}
+	} else if m.deleteDelay > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(m.deleteDelay):
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.delByFileCalled = true
 	doc, ok := m.documents[filePath]
 	if !ok {
@@ -57,6 +94,8 @@ func (m *mockStore) DeleteByFile(ctx context.Context, filePath string) error {
 }
 
 func (m *mockStore) Search(ctx context.Context, queryVector []float32, limit int, opts store.SearchOptions) ([]store.SearchResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	results := make([]store.SearchResult, 0, len(m.chunks))
 	for _, chunk := range m.chunks {
 		// Filter by path prefix if provided
@@ -79,6 +118,8 @@ func (m *mockStore) Search(ctx context.Context, queryVector []float32, limit int
 }
 
 func (m *mockStore) GetDocument(ctx context.Context, filePath string) (*store.Document, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.getDocCalled = true
 	doc, ok := m.documents[filePath]
 	if !ok {
@@ -88,18 +129,24 @@ func (m *mockStore) GetDocument(ctx context.Context, filePath string) (*store.Do
 }
 
 func (m *mockStore) SaveDocument(ctx context.Context, doc store.Document) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.saveDocCalled = true
 	m.documents[doc.Path] = doc
 	return nil
 }
 
 func (m *mockStore) DeleteDocument(ctx context.Context, filePath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.delDocCalled = true
 	delete(m.documents, filePath)
 	return nil
 }
 
 func (m *mockStore) ListDocuments(ctx context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.listDocsCalled = true
 	paths := make([]string, 0, len(m.documents))
 	for path := range m.documents {
@@ -109,6 +156,8 @@ func (m *mockStore) ListDocuments(ctx context.Context) ([]string, error) {
 }
 
 func (m *mockStore) ListDocumentSnapshots(ctx context.Context) ([]store.DocumentSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.listSnapsCalled = true
 	if m.listSnapshots != nil {
 		return m.listSnapshots, nil
@@ -139,6 +188,8 @@ func (m *mockStore) Close() error {
 }
 
 func (m *mockStore) GetStats(ctx context.Context) (*store.IndexStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return &store.IndexStats{
 		TotalFiles:  len(m.documents),
 		TotalChunks: len(m.chunks),
@@ -146,6 +197,8 @@ func (m *mockStore) GetStats(ctx context.Context) (*store.IndexStats, error) {
 }
 
 func (m *mockStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	stats := make([]store.FileStats, 0, len(m.documents))
 	for _, doc := range m.documents {
 		stats = append(stats, store.FileStats{
@@ -162,6 +215,8 @@ func (m *mockStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, 
 }
 
 func (m *mockStore) GetChunksForFile(ctx context.Context, filePath string) ([]store.Chunk, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	doc, ok := m.documents[filePath]
 	if !ok {
 		return nil, nil
@@ -176,11 +231,101 @@ func (m *mockStore) GetChunksForFile(ctx context.Context, filePath string) ([]st
 }
 
 func (m *mockStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	chunks := make([]store.Chunk, 0, len(m.chunks))
 	for _, chunk := range m.chunks {
 		chunks = append(chunks, chunk)
 	}
 	return chunks, nil
+}
+
+func (m *mockStore) LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lookupByHashCalls++
+	vec, ok := m.cachedVectors[contentHash]
+	return vec, ok, nil
+}
+
+func (m *mockStore) LookupByContentHashes(ctx context.Context, contentHashes []string) (map[string][]float32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bulkLookupCalls++
+	inputs := append([]string(nil), contentHashes...)
+	m.bulkLookupInputs = append(m.bulkLookupInputs, inputs)
+
+	results := make(map[string][]float32)
+	for _, hash := range contentHashes {
+		if vec, ok := m.cachedVectors[hash]; ok {
+			results[hash] = vec
+		}
+	}
+	return results, nil
+}
+
+type mockCacheOnlyStore struct {
+	base *mockStore
+}
+
+func (m *mockCacheOnlyStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
+	return m.base.SaveChunks(ctx, chunks)
+}
+
+func (m *mockCacheOnlyStore) DeleteByFile(ctx context.Context, filePath string) error {
+	return m.base.DeleteByFile(ctx, filePath)
+}
+
+func (m *mockCacheOnlyStore) Search(ctx context.Context, queryVector []float32, limit int, opts store.SearchOptions) ([]store.SearchResult, error) {
+	return m.base.Search(ctx, queryVector, limit, opts)
+}
+
+func (m *mockCacheOnlyStore) GetDocument(ctx context.Context, filePath string) (*store.Document, error) {
+	return m.base.GetDocument(ctx, filePath)
+}
+
+func (m *mockCacheOnlyStore) SaveDocument(ctx context.Context, doc store.Document) error {
+	return m.base.SaveDocument(ctx, doc)
+}
+
+func (m *mockCacheOnlyStore) DeleteDocument(ctx context.Context, filePath string) error {
+	return m.base.DeleteDocument(ctx, filePath)
+}
+
+func (m *mockCacheOnlyStore) ListDocuments(ctx context.Context) ([]string, error) {
+	return m.base.ListDocuments(ctx)
+}
+
+func (m *mockCacheOnlyStore) Load(ctx context.Context) error {
+	return m.base.Load(ctx)
+}
+
+func (m *mockCacheOnlyStore) Persist(ctx context.Context) error {
+	return m.base.Persist(ctx)
+}
+
+func (m *mockCacheOnlyStore) Close() error {
+	return m.base.Close()
+}
+
+func (m *mockCacheOnlyStore) GetStats(ctx context.Context) (*store.IndexStats, error) {
+	return m.base.GetStats(ctx)
+}
+
+func (m *mockCacheOnlyStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, error) {
+	return m.base.ListFilesWithStats(ctx)
+}
+
+func (m *mockCacheOnlyStore) GetChunksForFile(ctx context.Context, filePath string) ([]store.Chunk, error) {
+	return m.base.GetChunksForFile(ctx, filePath)
+}
+
+func (m *mockCacheOnlyStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
+	return m.base.GetAllChunks(ctx)
+}
+
+func (m *mockCacheOnlyStore) LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error) {
+	return m.base.LookupByContentHash(ctx, contentHash)
 }
 
 // mockEmbedder implements embedder.Embedder for testing
@@ -212,6 +357,73 @@ func (m *mockEmbedder) Dimensions() int {
 
 func (m *mockEmbedder) Close() error {
 	return nil
+}
+
+type mockParallelEmbedder struct {
+	parallelism int
+	delay       time.Duration
+	started     chan struct{}
+	startOnce   sync.Once
+	active      atomic.Int32
+	maxActive   atomic.Int32
+}
+
+func newMockParallelEmbedder(parallelism int) *mockParallelEmbedder {
+	return &mockParallelEmbedder{parallelism: parallelism}
+}
+
+func (m *mockParallelEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	vectors, err := m.EmbedBatch(ctx, []string{text})
+	if err != nil {
+		return nil, err
+	}
+	return vectors[0], nil
+}
+
+func (m *mockParallelEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if m.started != nil {
+		m.startOnce.Do(func() {
+			close(m.started)
+		})
+	}
+
+	active := m.active.Add(1)
+	for {
+		currentMax := m.maxActive.Load()
+		if active <= currentMax || m.maxActive.CompareAndSwap(currentMax, active) {
+			break
+		}
+	}
+	defer m.active.Add(-1)
+
+	if m.delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(m.delay):
+		}
+	}
+
+	vectors := make([][]float32, len(texts))
+	for i := range texts {
+		vectors[i] = []float32{0.1, 0.2, 0.3}
+	}
+	return vectors, nil
+}
+
+func (m *mockParallelEmbedder) Dimensions() int {
+	return 3
+}
+
+func (m *mockParallelEmbedder) Close() error {
+	return nil
+}
+
+func (m *mockParallelEmbedder) EmbeddingParallelism() int {
+	if m.parallelism <= 0 {
+		return 1
+	}
+	return m.parallelism
 }
 
 // TestIndexAllWithProgress_UnchangedFilesSkipped tests that files with matching ModTimes are skipped
@@ -894,6 +1106,303 @@ func TestIndexAllWithBatchProgress_StartsEmbeddingBeforeScanCompletes(t *testing
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+	}
+}
+
+func TestIndexAllWithBatchProgress_NonBatchEmbedsConcurrently(t *testing.T) {
+	tmpDir := t.TempDir()
+	for i := 0; i < 6; i++ {
+		path := filepath.Join(tmpDir, "file"+string(rune('a'+i))+".go")
+		if err := os.WriteFile(path, []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+			t.Fatalf("failed to create test file: %v", err)
+		}
+	}
+
+	mockStore := newMockStore()
+	mockEmb := newMockParallelEmbedder(3)
+	mockEmb.delay = 40 * time.Millisecond
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
+
+	if _, err := indexer.IndexAllWithBatchProgress(context.Background(), nil, nil); err != nil {
+		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+	}
+
+	if mockEmb.maxActive.Load() <= 1 {
+		t.Fatalf("expected concurrent non-batch embedding, max active = %d", mockEmb.maxActive.Load())
+	}
+}
+
+func TestIndexAllWithBatchProgress_NonBatchStartsEmbeddingBeforeScanCompletes(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+
+	scanComplete := make(chan struct{})
+	scanner.walkMetadata = func(ctx context.Context, onFile func(FileMeta) error, onSkipped func(string)) error {
+		files := []FileMeta{
+			{Path: "a.go", ModTime: time.Now().Unix()},
+			{Path: "b.go", ModTime: time.Now().Unix()},
+			{Path: "c.go", ModTime: time.Now().Unix()},
+		}
+		if err := onFile(files[0]); err != nil {
+			return err
+		}
+		time.Sleep(250 * time.Millisecond)
+		for _, meta := range files[1:] {
+			if err := onFile(meta); err != nil {
+				return err
+			}
+		}
+		close(scanComplete)
+		return nil
+	}
+	scanner.scanFile = func(relPath string) (*FileInfo, error) {
+		return &FileInfo{
+			Path:    relPath,
+			ModTime: time.Now().Unix(),
+			Hash:    relPath,
+			Content: "package main\n\nfunc main() {}\n",
+		}, nil
+	}
+
+	mockStore := newMockStore()
+	mockEmb := newMockParallelEmbedder(2)
+	mockEmb.delay = 50 * time.Millisecond
+	mockEmb.started = make(chan struct{})
+
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := indexer.IndexAllWithBatchProgress(context.Background(), nil, nil)
+		errCh <- err
+	}()
+
+	select {
+	case <-mockEmb.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected embedding to start")
+	}
+
+	select {
+	case <-scanComplete:
+		t.Fatal("scan completed before non-batch embedding started")
+	default:
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+	}
+}
+
+func TestIndexAllWithBatchProgress_NonBatchProgressMonotonic(t *testing.T) {
+	tmpDir := t.TempDir()
+	for i := 0; i < 5; i++ {
+		path := filepath.Join(tmpDir, "file"+string(rune('a'+i))+".go")
+		if err := os.WriteFile(path, []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+			t.Fatalf("failed to create test file: %v", err)
+		}
+	}
+
+	mockStore := newMockStore()
+	mockEmb := newMockParallelEmbedder(3)
+	mockEmb.delay = 25 * time.Millisecond
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
+
+	var progress []int
+	var mu sync.Mutex
+	_, err = indexer.IndexAllWithBatchProgress(context.Background(), nil, func(info BatchProgressInfo) {
+		mu.Lock()
+		progress = append(progress, info.CompletedChunks)
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 1; i < len(progress); i++ {
+		if progress[i] < progress[i-1] {
+			t.Fatalf("progress decreased: %d then %d", progress[i-1], progress[i])
+		}
+	}
+}
+
+func TestLookupCachedEmbeddings_UsesBulkCache(t *testing.T) {
+	mockStore := newMockStore()
+	mockStore.cachedVectors["hash-a"] = []float32{1}
+	mockStore.cachedVectors["hash-b"] = []float32{2}
+	idx := &Indexer{store: mockStore}
+
+	chunks := []ChunkInfo{
+		{ContentHash: "hash-a"},
+		{ContentHash: "hash-a"},
+		{ContentHash: "hash-b"},
+		{ContentHash: ""},
+	}
+
+	cached, hits, err := idx.lookupCachedEmbeddings(context.Background(), chunks)
+	if err != nil {
+		t.Fatalf("lookupCachedEmbeddings failed: %v", err)
+	}
+
+	if hits != 3 {
+		t.Fatalf("hits = %d, want 3", hits)
+	}
+	if len(cached) != 3 {
+		t.Fatalf("cached size = %d, want 3", len(cached))
+	}
+	if mockStore.bulkLookupCalls != 1 {
+		t.Fatalf("bulk lookup calls = %d, want 1", mockStore.bulkLookupCalls)
+	}
+	if mockStore.lookupByHashCalls != 0 {
+		t.Fatalf("single lookup calls = %d, want 0", mockStore.lookupByHashCalls)
+	}
+	if len(mockStore.bulkLookupInputs) != 1 || len(mockStore.bulkLookupInputs[0]) != 2 {
+		t.Fatalf("bulk lookup inputs = %#v, want one deduped batch of 2 hashes", mockStore.bulkLookupInputs)
+	}
+}
+
+func TestLookupCachedEmbeddings_FallsBackToSingleHashCache(t *testing.T) {
+	base := newMockStore()
+	base.cachedVectors["hash-a"] = []float32{1}
+	base.cachedVectors["hash-b"] = []float32{2}
+	idx := &Indexer{store: &mockCacheOnlyStore{base: base}}
+
+	chunks := []ChunkInfo{
+		{ContentHash: "hash-a"},
+		{ContentHash: "hash-a"},
+		{ContentHash: "hash-b"},
+	}
+
+	cached, hits, err := idx.lookupCachedEmbeddings(context.Background(), chunks)
+	if err != nil {
+		t.Fatalf("lookupCachedEmbeddings failed: %v", err)
+	}
+
+	if hits != 3 {
+		t.Fatalf("hits = %d, want 3", hits)
+	}
+	if len(cached) != 3 {
+		t.Fatalf("cached size = %d, want 3", len(cached))
+	}
+	if base.lookupByHashCalls != 2 {
+		t.Fatalf("single lookup calls = %d, want 2 deduped calls", base.lookupByHashCalls)
+	}
+	if base.bulkLookupCalls != 0 {
+		t.Fatalf("bulk lookup calls = %d, want 0", base.bulkLookupCalls)
+	}
+}
+
+func TestIndexAllWithProgress_RemovesDeletedFilesConcurrently(t *testing.T) {
+	tmpDir := t.TempDir()
+	mockStore := newMockStore()
+	mockStore.deleteDelay = 40 * time.Millisecond
+
+	for i := 0; i < 6; i++ {
+		path := "deleted-" + string(rune('a'+i)) + ".go"
+		chunkID := "chunk-" + string(rune('a'+i))
+		mockStore.documents[path] = store.Document{
+			Path:     path,
+			Hash:     "hash",
+			ModTime:  time.Now(),
+			ChunkIDs: []string{chunkID},
+		}
+		mockStore.chunks[chunkID] = store.Chunk{ID: chunkID}
+	}
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, newMockEmbedder(), chunker, scanner, time.Time{})
+
+	stats, err := indexer.IndexAllWithProgress(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("IndexAllWithProgress failed: %v", err)
+	}
+
+	if stats.FilesRemoved != 6 {
+		t.Fatalf("FilesRemoved = %d, want 6", stats.FilesRemoved)
+	}
+	if mockStore.deleteMaxActive.Load() <= 1 {
+		t.Fatalf("expected concurrent delete cleanup, max active = %d", mockStore.deleteMaxActive.Load())
+	}
+}
+
+func TestIndexAllWithProgress_DeleteCleanupStopsOnCancel(t *testing.T) {
+	tmpDir := t.TempDir()
+	mockStore := newMockStore()
+	blockCh := make(chan struct{})
+	mockStore.deleteBlock = blockCh
+
+	for i := 0; i < 6; i++ {
+		path := "deleted-" + string(rune('a'+i)) + ".go"
+		chunkID := "chunk-" + string(rune('a'+i))
+		mockStore.documents[path] = store.Document{
+			Path:     path,
+			Hash:     "hash",
+			ModTime:  time.Now(),
+			ChunkIDs: []string{chunkID},
+		}
+		mockStore.chunks[chunkID] = store.Chunk{ID: chunkID}
+	}
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, newMockEmbedder(), chunker, scanner, time.Time{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := indexer.IndexAllWithProgress(ctx, nil)
+		errCh <- err
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for mockStore.deleteActive.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for delete cleanup to start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil || !isContextCancellation(err) {
+			t.Fatalf("expected context cancellation, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("delete cleanup did not stop after cancellation")
 	}
 }
 

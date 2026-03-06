@@ -15,6 +15,7 @@ const (
 	qdrantDocHashField    = "doc_hash"
 	qdrantDocModTimeField = "doc_mod_time"
 	qdrantScrollPageSize  = 1000
+	qdrantHashBatchSize   = 256
 )
 
 // sanitizeUTF8 ensures the string contains only valid UTF-8 characters.
@@ -31,6 +32,7 @@ type QdrantStore struct {
 	collectionName string
 	dimensions     int
 	apiKey         string
+	scrollAllFunc  func(ctx context.Context, filter *qdrant.Filter, withPayload *qdrant.WithPayloadSelector, withVectors *qdrant.WithVectorsSelector) ([]*qdrant.RetrievedPoint, error)
 }
 
 func parseHost(endpoint string) string {
@@ -244,6 +246,10 @@ func (s *QdrantStore) scrollAll(
 	withPayload *qdrant.WithPayloadSelector,
 	withVectors *qdrant.WithVectorsSelector,
 ) ([]*qdrant.RetrievedPoint, error) {
+	if s.scrollAllFunc != nil {
+		return s.scrollAllFunc(ctx, filter, withPayload, withVectors)
+	}
+
 	var (
 		points []*qdrant.RetrievedPoint
 		offset *qdrant.PointId
@@ -616,32 +622,84 @@ func (s *QdrantStore) LookupByContentHash(ctx context.Context, contentHash strin
 		return nil, false, nil
 	}
 
-	filter := &qdrant.Filter{
-		Must: []*qdrant.Condition{
-			qdrant.NewMatch("content_hash", contentHash),
-		},
-	}
-
-	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: s.collectionName,
-		Filter:         filter,
-		Limit:          qdrant.PtrOf(uint32(1)),
-		WithVectors:    qdrant.NewWithVectors(true),
-	})
+	vectors, err := s.LookupByContentHashes(ctx, []string{contentHash})
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to lookup by content hash: %w", err)
+		return nil, false, err
 	}
-
-	if len(scrollResult) == 0 {
+	vector, ok := vectors[contentHash]
+	if !ok {
 		return nil, false, nil
 	}
+	return vector, true, nil
+}
 
-	point := scrollResult[0]
-	if point.Vectors != nil && point.Vectors.GetVector() != nil {
-		if dense := point.Vectors.GetVector().GetDense(); dense != nil {
-			return dense.GetData(), true, nil
+func (s *QdrantStore) LookupByContentHashes(ctx context.Context, contentHashes []string) (map[string][]float32, error) {
+	unique := dedupeNonEmptyStrings(contentHashes)
+	if len(unique) == 0 {
+		return nil, nil
+	}
+
+	results := make(map[string][]float32, len(unique))
+	for start := 0; start < len(unique); start += qdrantHashBatchSize {
+		end := start + qdrantHashBatchSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+
+		filter := &qdrant.Filter{
+			Must: []*qdrant.Condition{
+				qdrant.NewMatchKeywords("content_hash", unique[start:end]...),
+			},
+		}
+
+		points, err := s.scrollAll(
+			ctx,
+			filter,
+			qdrant.NewWithPayloadInclude("content_hash"),
+			qdrant.NewWithVectors(true),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to lookup by content hashes: %w", err)
+		}
+
+		for _, point := range points {
+			if point == nil {
+				continue
+			}
+			val, ok := point.Payload["content_hash"]
+			if !ok {
+				continue
+			}
+			hash := val.GetStringValue()
+			if hash == "" {
+				continue
+			}
+			if _, exists := results[hash]; exists {
+				continue
+			}
+			if point.Vectors != nil && point.Vectors.GetVector() != nil {
+				if dense := point.Vectors.GetVector().GetDense(); dense != nil {
+					results[hash] = dense.GetData()
+				}
+			}
 		}
 	}
 
-	return nil, false, nil
+	return results, nil
+}
+
+func dedupeNonEmptyStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }

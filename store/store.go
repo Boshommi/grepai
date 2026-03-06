@@ -117,6 +117,14 @@ type EmbeddingCache interface {
 	LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error)
 }
 
+// BulkEmbeddingCache is an optional extension for stores that can resolve
+// multiple content hashes in one backend request.
+type BulkEmbeddingCache interface {
+	// LookupByContentHashes returns vectors keyed by content hash for any hashes
+	// that exist in the store. Missing hashes are omitted from the result map.
+	LookupByContentHashes(ctx context.Context, contentHashes []string) (map[string][]float32, error)
+}
+
 // DocumentSnapshotLister is an optional store capability for bulk-loading
 // document metadata used during initial indexing.
 type DocumentSnapshotLister interface {

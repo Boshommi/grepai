@@ -4,19 +4,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	defaultLMStudioEndpoint = "http://127.0.0.1:1234"
-	defaultLMStudioModel    = "text-embedding-nomic-embed-text-v1.5"
-	lmStudioNomicDimensions = 768
+	defaultLMStudioEndpoint    = "http://127.0.0.1:1234"
+	defaultLMStudioModel       = "text-embedding-nomic-embed-text-v1.5"
+	lmStudioNomicDimensions    = 768
+	defaultLMStudioParallelism = 1
 )
 
 var (
@@ -29,7 +33,13 @@ type LMStudioEmbedder struct {
 	endpoint   string
 	model      string
 	dimensions int
+	parallelism int
 	client     *http.Client
+	rateLimiter *AdaptiveRateLimiter
+
+	gateMu   sync.Mutex
+	inFlight int
+	notifyCh chan struct{}
 }
 
 type lmStudioEmbedRequest struct {
@@ -70,19 +80,31 @@ func WithLMStudioDimensions(dimensions int) LMStudioOption {
 	}
 }
 
+func WithLMStudioParallelism(parallelism int) LMStudioOption {
+	return func(e *LMStudioEmbedder) {
+		if parallelism > 0 {
+			e.parallelism = parallelism
+		}
+	}
+}
+
 func NewLMStudioEmbedder(opts ...LMStudioOption) *LMStudioEmbedder {
 	e := &LMStudioEmbedder{
-		endpoint:   defaultLMStudioEndpoint,
-		model:      defaultLMStudioModel,
-		dimensions: lmStudioNomicDimensions,
+		endpoint:    defaultLMStudioEndpoint,
+		model:       defaultLMStudioModel,
+		dimensions:  lmStudioNomicDimensions,
+		parallelism: defaultLMStudioParallelism,
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+		notifyCh: make(chan struct{}, 1),
 	}
 
 	for _, opt := range opts {
 		opt(e)
 	}
+
+	e.rateLimiter = NewAdaptiveRateLimiter(e.parallelism)
 
 	return e
 }
@@ -99,6 +121,10 @@ func (e *LMStudioEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 	if len(texts) == 0 {
 		return nil, nil
 	}
+	if err := e.acquirePermit(ctx); err != nil {
+		return nil, err
+	}
+	defer e.releasePermit()
 
 	reqBody := lmStudioEmbedRequest{
 		Model: e.model,
@@ -122,6 +148,7 @@ func (e *LMStudioEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		e.recordTransientFailure(err)
 		return nil, fmt.Errorf("failed to send request to LM Studio: %w", err)
 	}
 	defer resp.Body.Close()
@@ -144,6 +171,7 @@ func (e *LMStudioEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 		if ctxErr := parseLMStudioContextLengthError(msg, texts); ctxErr != nil {
 			return nil, ctxErr
 		}
+		e.recordHTTPFailure(resp.StatusCode)
 
 		return nil, fmt.Errorf("LM Studio returned status %d: %s", resp.StatusCode, msg)
 	}
@@ -161,12 +189,20 @@ func (e *LMStudioEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 	for _, item := range result.Data {
 		embeddings[item.Index] = item.Embedding
 	}
+	e.recordSuccess()
 
 	return embeddings, nil
 }
 
 func (e *LMStudioEmbedder) Dimensions() int {
 	return e.dimensions
+}
+
+func (e *LMStudioEmbedder) EmbeddingParallelism() int {
+	if e.parallelism <= 0 {
+		return 1
+	}
+	return e.parallelism
 }
 
 func (e *LMStudioEmbedder) Close() error {
@@ -266,4 +302,92 @@ func estimateLMStudioFailedInputIndex(texts []string, maxTokens int) int {
 	}
 
 	return longestIndex
+}
+
+func (e *LMStudioEmbedder) acquirePermit(ctx context.Context) error {
+	for {
+		e.gateMu.Lock()
+		limit := 1
+		if e.rateLimiter != nil {
+			limit = e.rateLimiter.CurrentWorkers()
+		}
+		if e.inFlight < limit {
+			e.inFlight++
+			e.gateMu.Unlock()
+			return nil
+		}
+		notifyCh := e.notifyCh
+		e.gateMu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-notifyCh:
+		}
+	}
+}
+
+func (e *LMStudioEmbedder) releasePermit() {
+	e.gateMu.Lock()
+	if e.inFlight > 0 {
+		e.inFlight--
+	}
+	e.gateMu.Unlock()
+	e.signalWaiters()
+}
+
+func (e *LMStudioEmbedder) signalWaiters() {
+	if e.notifyCh == nil {
+		return
+	}
+	select {
+	case e.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (e *LMStudioEmbedder) recordSuccess() {
+	if e.rateLimiter != nil && e.rateLimiter.OnSuccess() {
+		e.signalWaiters()
+	}
+}
+
+func (e *LMStudioEmbedder) recordHTTPFailure(statusCode int) {
+	if statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout {
+		e.recordTransientFailure(nil)
+	}
+}
+
+func (e *LMStudioEmbedder) recordTransientFailure(err error) {
+	if e.rateLimiter == nil {
+		return
+	}
+	if err != nil && !isLMStudioTransientTransportError(err) {
+		return
+	}
+	if e.rateLimiter.OnRateLimitHit() {
+		e.signalWaiters()
+	}
+}
+
+func isLMStudioTransientTransportError(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe")
 }

@@ -111,13 +111,11 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 	}
 
-	for path := range remainingDocs {
-		if err := idx.RemoveFile(ctx, path); err != nil {
-			log.Printf("Failed to remove %s: %v", path, err)
-			continue
-		}
-		stats.FilesRemoved++
+	removed, err := idx.removeRemainingDocuments(ctx, remainingDocs)
+	if err != nil {
+		return nil, err
 	}
+	stats.FilesRemoved = removed
 
 	stats.FilesIndexed = int(counters.filesIndexed.Load())
 	stats.FilesSkipped = int(counters.filesSkipped.Load())
@@ -160,6 +158,13 @@ type preparedFile struct {
 	existingChunkCnt int
 }
 
+type preparedFileResult struct {
+	prepared       *preparedFile
+	chunksCreated  int
+	embeddedChunks int
+	err            error
+}
+
 type batchFileState struct {
 	prepared  *preparedFile
 	vectors   [][]float32
@@ -199,6 +204,26 @@ func scanWorkerCount() int {
 		workers = maxScanWorkers
 	}
 	return workers
+}
+
+func deleteWorkerCount() int {
+	workers := scanWorkerCount()
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 1 {
+		return 1
+	}
+	return workers
+}
+
+func nonBatchEmbedWorkerCount(emb embedder.Embedder) int {
+	if hint, ok := emb.(embedder.ParallelismHint); ok {
+		if workers := hint.EmbeddingParallelism(); workers > 0 {
+			return workers
+		}
+	}
+	return 1
 }
 
 func (idx *Indexer) loadDocumentSnapshots(ctx context.Context) (map[string]store.DocumentSnapshot, error) {
@@ -492,6 +517,44 @@ func (idx *Indexer) startPrepareWorkers(
 	return &workerWG
 }
 
+func (idx *Indexer) startNonBatchEmbedWorkers(
+	ctx context.Context,
+	workers int,
+	embedTasks <-chan *preparedFile,
+	resultCh chan<- preparedFileResult,
+) *sync.WaitGroup {
+	var workerWG sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case prepared, ok := <-embedTasks:
+					if !ok {
+						return
+					}
+
+					chunksCreated, embeddedChunks, err := idx.embedPreparedFileSequential(ctx, prepared)
+					select {
+					case <-ctx.Done():
+						return
+					case resultCh <- preparedFileResult{
+						prepared:       prepared,
+						chunksCreated:  chunksCreated,
+						embeddedChunks: embeddedChunks,
+						err:            err,
+					}:
+					}
+				}
+			}
+		}()
+	}
+	return &workerWG
+}
+
 func (idx *Indexer) indexAllSequentialPipeline(
 	ctx context.Context,
 	snapshots map[string]store.DocumentSnapshot,
@@ -503,6 +566,8 @@ func (idx *Indexer) indexAllSequentialPipeline(
 	workers := scanWorkerCount()
 	scanTasks := make(chan fileScanTask, workers*pipelineBufferFactor)
 	preparedCh := make(chan *preparedFile, workers*pipelineBufferFactor)
+	embedTasks := make(chan *preparedFile, workers*pipelineBufferFactor)
+	resultCh := make(chan preparedFileResult, workers*pipelineBufferFactor)
 	walkErrCh := make(chan error, 1)
 
 	go func() {
@@ -516,47 +581,84 @@ func (idx *Indexer) indexAllSequentialPipeline(
 		close(preparedCh)
 	}()
 
-	var (
-		discoveredChunks atomic.Int64
-		completedChunks  atomic.Int64
-	)
+	embedWG := idx.startNonBatchEmbedWorkers(ctx, nonBatchEmbedWorkerCount(idx.embedder), embedTasks, resultCh)
+	go func() {
+		embedWG.Wait()
+		close(resultCh)
+	}()
 
-	for prepared := range preparedCh {
-		discoveredChunks.Add(int64(len(prepared.uncachedChunks)))
-		emitBatchProgress(onBatchProgress, BatchProgressInfo{
-			CompletedChunks: int(completedChunks.Load()),
-			TotalChunks:     int(discoveredChunks.Load()),
-			KnownTotal:      false,
-		})
+	discoveredChunks := 0
+	completedChunks := 0
+	preparedOpen := true
+	resultsOpen := true
+	totalsKnown := false
+	preparedInput := preparedCh
+	resultInput := resultCh
 
-		chunksCreated, embeddedChunks, err := idx.embedPreparedFileSequential(ctx, prepared)
-		if err != nil {
-			if isContextCancellation(err) || ctx.Err() != nil {
-				return err
+	for preparedOpen || resultsOpen {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case prepared, ok := <-preparedInput:
+			if !ok {
+				preparedOpen = false
+				preparedInput = nil
+				totalsKnown = true
+				close(embedTasks)
+				if discoveredChunks > 0 {
+					emitBatchProgress(onBatchProgress, BatchProgressInfo{
+						CompletedChunks: completedChunks,
+						TotalChunks:     discoveredChunks,
+						KnownTotal:      true,
+					})
+				}
+				continue
 			}
-			log.Printf("Failed to index %s: %v", prepared.file.Path, err)
-			continue
-		}
-		if chunksCreated > 0 {
-			counters.filesIndexed.Add(1)
-			counters.chunksCreated.Add(int64(chunksCreated))
-		}
 
-		if embeddedChunks > 0 {
-			completedChunks.Add(int64(embeddedChunks))
+			discoveredChunks += len(prepared.uncachedChunks)
+			emitBatchProgress(onBatchProgress, BatchProgressInfo{
+				CompletedChunks: completedChunks,
+				TotalChunks:     discoveredChunks,
+				KnownTotal:      false,
+			})
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case embedTasks <- prepared:
+			}
+		case result, ok := <-resultInput:
+			if !ok {
+				resultsOpen = false
+				resultInput = nil
+				continue
+			}
+			if result.err != nil {
+				if isContextCancellation(result.err) || ctx.Err() != nil {
+					return result.err
+				}
+				log.Printf("Failed to index %s: %v", result.prepared.file.Path, result.err)
+				continue
+			}
+			if result.chunksCreated > 0 {
+				counters.filesIndexed.Add(1)
+				counters.chunksCreated.Add(int64(result.chunksCreated))
+			}
+
+			completedChunks += result.embeddedChunks
+			emitBatchProgress(onBatchProgress, BatchProgressInfo{
+				CompletedChunks: completedChunks,
+				TotalChunks:     discoveredChunks,
+				KnownTotal:      totalsKnown,
+			})
 		}
-		emitBatchProgress(onBatchProgress, BatchProgressInfo{
-			CompletedChunks: int(completedChunks.Load()),
-			TotalChunks:     int(discoveredChunks.Load()),
-			KnownTotal:      false,
-		})
 	}
 
 	walkErr := <-walkErrCh
-	if discoveredChunks.Load() > 0 {
+	if discoveredChunks > 0 {
 		emitBatchProgress(onBatchProgress, BatchProgressInfo{
-			CompletedChunks: int(completedChunks.Load()),
-			TotalChunks:     int(discoveredChunks.Load()),
+			CompletedChunks: completedChunks,
+			TotalChunks:     discoveredChunks,
 			KnownTotal:      true,
 		})
 	}
@@ -588,6 +690,60 @@ func batchSizeTotal(batches []embedder.Batch) int {
 		total += len(batch.Entries)
 	}
 	return total
+}
+
+func (idx *Indexer) removeRemainingDocuments(ctx context.Context, remainingDocs map[string]bool) (int, error) {
+	if len(remainingDocs) == 0 {
+		return 0, nil
+	}
+
+	paths := make(chan string, deleteWorkerCount())
+	var (
+		removedCount atomic.Int64
+		workerWG     sync.WaitGroup
+	)
+
+	for worker := 0; worker < deleteWorkerCount(); worker++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case path, ok := <-paths:
+					if !ok {
+						return
+					}
+					if err := idx.RemoveFile(ctx, path); err != nil {
+						if isContextCancellation(err) || ctx.Err() != nil {
+							return
+						}
+						log.Printf("Failed to remove %s: %v", path, err)
+						continue
+					}
+					removedCount.Add(1)
+				}
+			}
+		}()
+	}
+
+	for path := range remainingDocs {
+		select {
+		case <-ctx.Done():
+			close(paths)
+			workerWG.Wait()
+			return int(removedCount.Load()), ctx.Err()
+		case paths <- path:
+		}
+	}
+	close(paths)
+	workerWG.Wait()
+
+	if ctx.Err() != nil {
+		return int(removedCount.Load()), ctx.Err()
+	}
+	return int(removedCount.Load()), nil
 }
 
 func (idx *Indexer) startBatchEmbedWorker(
@@ -1016,8 +1172,6 @@ func (idx *Indexer) indexFilesBatched(
 		return 0, 0, nil
 	}
 
-	// Check embedding cache for content-addressed deduplication
-	cache, hasCache := idx.store.(store.EmbeddingCache)
 	var totalCacheHits int
 
 	// Pre-fill cached embeddings and filter out fully-cached files
@@ -1032,32 +1186,21 @@ func (idx *Indexer) indexFilesBatched(
 	var remainingFileChunks []embedder.FileChunks
 
 	for i, fd := range fileData {
-		if !hasCache {
-			remainingFileData = append(remainingFileData, fd)
-			remainingFileChunks = append(remainingFileChunks, fileChunks[i])
-			continue
+		cachedVectors, cacheHits, err := idx.lookupCachedEmbeddings(ctx, fd.chunkInfos)
+		if err != nil {
+			return filesIndexed, chunksCreated, err
 		}
-
 		vecs := make([][]float32, len(fd.chunkInfos))
-		allCached := true
-		for j, chunk := range fd.chunkInfos {
-			if chunk.ContentHash == "" {
+		allCached := cacheHits == len(fd.chunkInfos) && len(fd.chunkInfos) > 0
+		for j := range fd.chunkInfos {
+			vec, found := cachedVectors[j]
+			if !found {
 				allCached = false
 				continue
 			}
-			vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
-			if err != nil {
-				log.Printf("Warning: cache lookup failed: %v", err)
-				allCached = false
-				continue
-			}
-			if found {
-				vecs[j] = vec
-				totalCacheHits++
-			} else {
-				allCached = false
-			}
+			vecs[j] = vec
 		}
+		totalCacheHits += cacheHits
 
 		if allCached {
 			preFilledFiles = append(preFilledFiles, preFilled{fdIndex: i, vectors: vecs, allCached: true})
@@ -1324,26 +1467,62 @@ func (idx *Indexer) embedChunkWithReChunking(ctx context.Context, chunk ChunkInf
 // cached vectors for chunks with matching content hashes. The returned map maps
 // chunk index to cached vector. Chunks not in the map need fresh embedding.
 func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkInfo) (map[int][]float32, int, error) {
-	cache, ok := idx.store.(store.EmbeddingCache)
-	if !ok {
+	bulkCache, hasBulk := idx.store.(store.BulkEmbeddingCache)
+	singleCache, hasSingle := idx.store.(store.EmbeddingCache)
+	if !hasBulk && !hasSingle {
 		return nil, 0, nil
 	}
 
 	cached := make(map[int][]float32)
+	hashToIndices := make(map[string][]int)
+	uniqueHashes := make([]string, 0, len(chunks))
 	for i, chunk := range chunks {
 		if chunk.ContentHash == "" {
 			continue
 		}
-		vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
+		if _, ok := hashToIndices[chunk.ContentHash]; !ok {
+			uniqueHashes = append(uniqueHashes, chunk.ContentHash)
+		}
+		hashToIndices[chunk.ContentHash] = append(hashToIndices[chunk.ContentHash], i)
+	}
+	if len(uniqueHashes) == 0 {
+		return cached, 0, nil
+	}
+
+	if hasBulk {
+		vectorsByHash, err := bulkCache.LookupByContentHashes(ctx, uniqueHashes)
 		if err != nil {
 			if isContextCancellation(err) || ctx.Err() != nil {
 				return nil, 0, err
 			}
-			log.Printf("Warning: cache lookup failed for content hash %s: %v", chunk.ContentHash[:8], err)
+			log.Printf("Warning: bulk cache lookup failed: %v", err)
+		} else {
+			for hash, vec := range vectorsByHash {
+				for _, index := range hashToIndices[hash] {
+					cached[index] = vec
+				}
+			}
+			return cached, len(cached), nil
+		}
+	}
+
+	if !hasSingle {
+		return cached, len(cached), nil
+	}
+
+	for _, hash := range uniqueHashes {
+		vec, found, err := singleCache.LookupByContentHash(ctx, hash)
+		if err != nil {
+			if isContextCancellation(err) || ctx.Err() != nil {
+				return nil, 0, err
+			}
+			log.Printf("Warning: cache lookup failed for content hash %s: %v", hash[:8], err)
 			continue
 		}
 		if found {
-			cached[i] = vec
+			for _, index := range hashToIndices[hash] {
+				cached[index] = vec
+			}
 		}
 	}
 

@@ -28,7 +28,7 @@ embedder:
   # Vector dimensions (depends on model, auto-detected if not set)
   dimensions: 768
   # Concurrent batch requests for OpenAI (default: 4)
-  parallelism: 4
+  parallelism: 4  # Max concurrent embedding requests for supporting providers
 
 # Vector store configuration
 store:
@@ -154,7 +154,7 @@ embedder:
   model: text-embedding-3-small
   api_key: ${OPENAI_API_KEY}
   dimensions: 1536
-  parallelism: 4  # Concurrent requests (auto-adjusts on rate limits)
+  parallelism: 4  # Max concurrent embedding requests (auto-adjusts on transient overloads)
 ```
 
 Available models:

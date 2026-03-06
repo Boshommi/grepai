@@ -181,21 +181,21 @@ embedder:
 
 ### Parallelism & Rate Limiting
 
-OpenAI embeddings support parallel batch processing with adaptive rate limiting:
+Supporting embedders use `parallelism` as the maximum number of concurrent embedding requests. OpenAI uses it for parallel batch processing, and LM Studio uses it as the ceiling for concurrent local embedding requests with adaptive backoff:
 
 ```yaml
 embedder:
   provider: openai
   model: text-embedding-3-small
   api_key: ${OPENAI_API_KEY}
-  parallelism: 4  # Concurrent API requests (default: 4)
+  parallelism: 4  # Max concurrent embedding requests (default: 4)
 ```
 
 **How it works:**
 
-- Batches are processed concurrently up to `parallelism` limit
-- On rate limit (429), parallelism auto-reduces and retries with backoff
-- After successful requests, parallelism gradually restores
+- OpenAI processes batches concurrently up to the `parallelism` limit
+- LM Studio allows up to `parallelism` in-flight embedding requests during indexing
+- Transient overloads reduce effective concurrency, and successful requests gradually restore it
 
 #### Recommended Parallelism by Tier
 

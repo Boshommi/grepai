@@ -18,6 +18,18 @@ func mustCreateValue(t *testing.T, value interface{}) *qdrant.Value {
 	return val
 }
 
+func mustCreateVectorsOutput(data []float32) *qdrant.VectorsOutput {
+	return &qdrant.VectorsOutput{
+		VectorsOptions: &qdrant.VectorsOutput_Vector{
+			Vector: &qdrant.VectorOutput{
+				Vector: &qdrant.VectorOutput_Dense{
+					Dense: &qdrant.DenseVector{Data: data},
+				},
+			},
+		},
+	}
+}
+
 // TestSanitizeCollectionName tests the exported SanitizeCollectionName function
 func TestSanitizeCollectionName(t *testing.T) {
 	tests := []struct {
@@ -300,6 +312,113 @@ func TestBuildAndParseQdrantDocumentPayload(t *testing.T) {
 	}
 	if !modTime.Equal(now) {
 		t.Fatalf("modTime = %v, want %v", modTime, now)
+	}
+}
+
+func TestLookupByContentHashes_EmptyInput(t *testing.T) {
+	store := &QdrantStore{
+		scrollAllFunc: func(ctx context.Context, filter *qdrant.Filter, withPayload *qdrant.WithPayloadSelector, withVectors *qdrant.WithVectorsSelector) ([]*qdrant.RetrievedPoint, error) {
+			t.Fatal("scrollAll should not be called for empty input")
+			return nil, nil
+		},
+	}
+
+	vectors, err := store.LookupByContentHashes(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("LookupByContentHashes failed: %v", err)
+	}
+	if len(vectors) != 0 {
+		t.Fatalf("expected no vectors, got %d", len(vectors))
+	}
+}
+
+func TestLookupByContentHashes_DedupesAndReturnsPartialHits(t *testing.T) {
+	store := &QdrantStore{}
+	var batches [][]string
+	store.scrollAllFunc = func(ctx context.Context, filter *qdrant.Filter, withPayload *qdrant.WithPayloadSelector, withVectors *qdrant.WithVectorsSelector) ([]*qdrant.RetrievedPoint, error) {
+		hashes := filter.Must[0].GetField().GetMatch().GetKeywords().GetStrings()
+		batches = append(batches, append([]string(nil), hashes...))
+		return []*qdrant.RetrievedPoint{
+			{
+				Payload: map[string]*qdrant.Value{
+					"content_hash": mustCreateValue(t, "hash-a"),
+				},
+				Vectors: mustCreateVectorsOutput([]float32{1, 2, 3}),
+			},
+			{
+				Payload: map[string]*qdrant.Value{
+					"content_hash": mustCreateValue(t, "hash-a"),
+				},
+				Vectors: mustCreateVectorsOutput([]float32{9, 9, 9}),
+			},
+			{
+				Payload: map[string]*qdrant.Value{
+					"content_hash": mustCreateValue(t, "hash-b"),
+				},
+				Vectors: mustCreateVectorsOutput([]float32{4, 5, 6}),
+			},
+		}, nil
+	}
+
+	vectors, err := store.LookupByContentHashes(context.Background(), []string{"hash-a", "hash-a", "hash-b", "hash-missing"})
+	if err != nil {
+		t.Fatalf("LookupByContentHashes failed: %v", err)
+	}
+
+	if len(batches) != 1 {
+		t.Fatalf("expected 1 batch, got %d", len(batches))
+	}
+	if len(batches[0]) != 3 {
+		t.Fatalf("expected deduped batch of 3 hashes, got %d", len(batches[0]))
+	}
+	if len(vectors) != 2 {
+		t.Fatalf("expected 2 hits, got %d", len(vectors))
+	}
+	if got := vectors["hash-a"]; len(got) != 3 || got[0] != 1 {
+		t.Fatalf("unexpected vector for hash-a: %#v", got)
+	}
+	if got := vectors["hash-b"]; len(got) != 3 || got[0] != 4 {
+		t.Fatalf("unexpected vector for hash-b: %#v", got)
+	}
+}
+
+func TestLookupByContentHashes_BatchesLargeRequests(t *testing.T) {
+	store := &QdrantStore{}
+	var batchSizes []int
+	store.scrollAllFunc = func(ctx context.Context, filter *qdrant.Filter, withPayload *qdrant.WithPayloadSelector, withVectors *qdrant.WithVectorsSelector) ([]*qdrant.RetrievedPoint, error) {
+		hashes := filter.Must[0].GetField().GetMatch().GetKeywords().GetStrings()
+		batchSizes = append(batchSizes, len(hashes))
+
+		points := make([]*qdrant.RetrievedPoint, 0, len(hashes))
+		for _, hash := range hashes {
+			points = append(points, &qdrant.RetrievedPoint{
+				Payload: map[string]*qdrant.Value{
+					"content_hash": mustCreateValue(t, hash),
+				},
+				Vectors: mustCreateVectorsOutput([]float32{1}),
+			})
+		}
+		return points, nil
+	}
+
+	hashes := make([]string, 300)
+	for i := range hashes {
+		hashes[i] = "hash-" + uuid.NewString()
+	}
+
+	vectors, err := store.LookupByContentHashes(context.Background(), hashes)
+	if err != nil {
+		t.Fatalf("LookupByContentHashes failed: %v", err)
+	}
+
+	if len(batchSizes) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(batchSizes))
+	}
+	if batchSizes[0] != 256 || batchSizes[1] != 44 {
+		t.Fatalf("unexpected batch sizes: %#v", batchSizes)
+	}
+	if len(vectors) != len(hashes) {
+		t.Fatalf("expected %d vectors, got %d", len(hashes), len(vectors))
 	}
 }
 

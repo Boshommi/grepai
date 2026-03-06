@@ -29,6 +29,12 @@ type BatchLimiter interface {
 	BatchLimits() BatchLimits
 }
 
+// ParallelismHint is optionally implemented by embedders that support
+// concurrent embedding requests outside the BatchEmbedder path.
+type ParallelismHint interface {
+	EmbeddingParallelism() int
+}
+
 // BatchEmbedder extends Embedder with cross-file batch embedding capabilities.
 // Providers that support advanced batching (like OpenAI) implement this interface
 // to enable parallel processing of multiple batches.

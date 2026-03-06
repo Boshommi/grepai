@@ -37,6 +37,7 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 		opts := []LMStudioOption{
 			WithLMStudioEndpoint(cfg.Embedder.Endpoint),
 			WithLMStudioModel(cfg.Embedder.Model),
+			WithLMStudioParallelism(cfg.Embedder.Parallelism),
 		}
 		if cfg.Embedder.Dimensions != nil {
 			opts = append(opts, WithLMStudioDimensions(*cfg.Embedder.Dimensions))
