@@ -2,9 +2,11 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -132,6 +134,7 @@ const (
 	pipelineBufferFactor = 2
 	batchWindowSize      = 8
 	batchFlushInterval   = 100 * time.Millisecond
+	embeddingProbeFile   = "grepai_preflight_probe.go"
 )
 
 type indexPipelineCounters struct {
@@ -149,11 +152,11 @@ type fileScanTask struct {
 
 type preparedFile struct {
 	file             FileInfo
-	chunkInfos        []ChunkInfo
-	cachedVectors     map[int][]float32
-	uncachedChunks    []ChunkInfo
-	uncachedIndices   []int
-	existingChunkCnt  int
+	chunkInfos       []ChunkInfo
+	cachedVectors    map[int][]float32
+	uncachedChunks   []ChunkInfo
+	uncachedIndices  []int
+	existingChunkCnt int
 }
 
 type batchFileState struct {
@@ -172,6 +175,10 @@ type batchWindowResult struct {
 	request   batchWindowRequest
 	results   []embedder.BatchResult
 	windowErr error
+}
+
+func isContextCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func scanWorkerCount() int {
@@ -316,20 +323,23 @@ func (idx *Indexer) prepareFileForIndexing(ctx context.Context, file FileInfo, e
 	chunkInfos := idx.chunker.ChunkWithContext(file.Path, file.Content)
 	if len(chunkInfos) == 0 {
 		return &preparedFile{
-			file:            file,
+			file:             file,
 			existingChunkCnt: existingChunkCnt,
 		}, nil
 	}
 
-	cachedVectors, cacheHits := idx.lookupCachedEmbeddings(ctx, chunkInfos)
+	cachedVectors, cacheHits, err := idx.lookupCachedEmbeddings(ctx, chunkInfos)
+	if err != nil {
+		return nil, err
+	}
 	if cacheHits > 0 {
 		log.Printf("Reused %d cached embeddings for %s", cacheHits, file.Path)
 	}
 
 	prepared := &preparedFile{
-		file:            file,
-		chunkInfos:      chunkInfos,
-		cachedVectors:   cachedVectors,
+		file:             file,
+		chunkInfos:       chunkInfos,
+		cachedVectors:    cachedVectors,
 		existingChunkCnt: existingChunkCnt,
 	}
 
@@ -446,6 +456,9 @@ func (idx *Indexer) startPrepareWorkers(
 			for task := range scanTasks {
 				prepared, countedSkip, err := idx.scanAndPrepareTask(ctx, task)
 				if err != nil {
+					if isContextCancellation(err) || ctx.Err() != nil {
+						return
+					}
 					log.Printf("Failed to scan %s: %v", task.meta.Path, err)
 					if countedSkip {
 						counters.filesSkipped.Add(1)
@@ -509,6 +522,9 @@ func (idx *Indexer) indexAllSequentialPipeline(
 
 		chunksCreated, embeddedChunks, err := idx.embedPreparedFileSequential(ctx, prepared)
 		if err != nil {
+			if isContextCancellation(err) || ctx.Err() != nil {
+				return err
+			}
 			log.Printf("Failed to index %s: %v", prepared.file.Path, err)
 			continue
 		}
@@ -735,6 +751,10 @@ func (idx *Indexer) indexAllBatchPipeline(
 
 			if len(prepared.chunkInfos) == 0 {
 				if err := idx.deleteExistingChunks(ctx, prepared.file.Path, prepared.existingChunkCnt); err != nil {
+					if isContextCancellation(err) || ctx.Err() != nil {
+						close(requestCh)
+						return err
+					}
 					log.Printf("Failed to index %s: %v", prepared.file.Path, err)
 				}
 				continue
@@ -747,6 +767,10 @@ func (idx *Indexer) indexAllBatchPipeline(
 				}
 				chunksCreated, err := idx.savePreparedFile(ctx, prepared, prepared.chunkInfos, vectors)
 				if err != nil {
+					if isContextCancellation(err) || ctx.Err() != nil {
+						close(requestCh)
+						return err
+					}
 					log.Printf("Failed to index %s: %v", prepared.file.Path, err)
 					continue
 				}
@@ -790,6 +814,9 @@ func (idx *Indexer) indexAllBatchPipeline(
 			windowInFlight = false
 			if result.windowErr != nil {
 				close(requestCh)
+				if isContextCancellation(result.windowErr) || ctx.Err() != nil {
+					return result.windowErr
+				}
 				return fmt.Errorf("failed to embed batches: %w", result.windowErr)
 			}
 
@@ -1098,7 +1125,10 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 	}
 
 	// Check embedding cache for content-addressed deduplication
-	cachedVectors, cacheHits := idx.lookupCachedEmbeddings(ctx, chunkInfos)
+	cachedVectors, cacheHits, err := idx.lookupCachedEmbeddings(ctx, chunkInfos)
+	if err != nil {
+		return 0, fmt.Errorf("failed to lookup cached embeddings: %w", err)
+	}
 	if cacheHits > 0 {
 		log.Printf("Reused %d cached embeddings for %s", cacheHits, file.Path)
 	}
@@ -1277,10 +1307,10 @@ func (idx *Indexer) embedWithReChunking(ctx context.Context, chunks []ChunkInfo)
 // lookupCachedEmbeddings checks if the store implements EmbeddingCache and returns
 // cached vectors for chunks with matching content hashes. The returned map maps
 // chunk index to cached vector. Chunks not in the map need fresh embedding.
-func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkInfo) (map[int][]float32, int) {
+func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkInfo) (map[int][]float32, int, error) {
 	cache, ok := idx.store.(store.EmbeddingCache)
 	if !ok {
-		return nil, 0
+		return nil, 0, nil
 	}
 
 	cached := make(map[int][]float32)
@@ -1290,6 +1320,9 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkIn
 		}
 		vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
 		if err != nil {
+			if isContextCancellation(err) || ctx.Err() != nil {
+				return nil, 0, err
+			}
 			log.Printf("Warning: cache lookup failed for content hash %s: %v", chunk.ContentHash[:8], err)
 			continue
 		}
@@ -1298,7 +1331,89 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkIn
 		}
 	}
 
-	return cached, len(cached)
+	return cached, len(cached), nil
+}
+
+func (idx *Indexer) PreflightEmbedding(ctx context.Context) error {
+	if idx.embedder == nil || idx.chunker == nil {
+		return nil
+	}
+
+	probe, ok := idx.buildEmbeddingProbeChunk()
+	if !ok {
+		return nil
+	}
+
+	if _, err := idx.embedder.EmbedBatch(ctx, []string{probe.Content}); err != nil {
+		if isContextCancellation(err) || ctx.Err() != nil {
+			return err
+		}
+
+		if ctxErr := embedder.AsContextLengthError(err); ctxErr != nil {
+			message := fmt.Sprintf(
+				"configured chunking.size=%d is incompatible with the embedding model context window",
+				idx.chunker.ChunkSize(),
+			)
+			if ctxErr.MaxTokens > 0 {
+				recommended := recommendedChunkSizeForLimit(idx.chunker.ChunkSize(), ctxErr.MaxTokens)
+				message = fmt.Sprintf("%s (provider limit is about %d tokens; try %d)", message, ctxErr.MaxTokens, recommended)
+			}
+			return fmt.Errorf("%s: %w", message, err)
+		}
+
+		return fmt.Errorf("embedding batch probe failed: %w", err)
+	}
+
+	return nil
+}
+
+func (idx *Indexer) buildEmbeddingProbeChunk() (ChunkInfo, bool) {
+	if idx.chunker == nil {
+		return ChunkInfo{}, false
+	}
+
+	line := "func grepaiPreflightProbe() string { return \"semantic code search embedding probe\" }\n"
+	content := strings.Repeat(line, idx.chunker.ChunkSize())
+	if content == "" {
+		content = line
+	}
+
+	for attempt := 0; attempt < 4; attempt++ {
+		chunks := idx.chunker.ChunkWithContext(embeddingProbeFile, content)
+		if len(chunks) == 0 {
+			return ChunkInfo{}, false
+		}
+		if len(chunks[0].Content) >= idx.chunker.ChunkSize()*CharsPerToken || attempt == 3 {
+			return chunks[0], true
+		}
+		content += content
+	}
+
+	return ChunkInfo{}, false
+}
+
+func recommendedChunkSizeForLimit(currentChunkSize, maxTokens int) int {
+	if maxTokens <= 0 {
+		if currentChunkSize <= 64 {
+			return 32
+		}
+		return currentChunkSize / 2
+	}
+
+	recommended := (maxTokens * 3) / 4
+	if recommended < 32 {
+		recommended = maxTokens / 2
+	}
+	if recommended < 16 {
+		recommended = 16
+	}
+	if recommended >= currentChunkSize {
+		recommended = currentChunkSize - 1
+	}
+	if recommended < 16 {
+		recommended = 16
+	}
+	return recommended
 }
 
 // RemoveFile removes a file from the index

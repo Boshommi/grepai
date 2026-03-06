@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Boshommi/grepai/config"
+	"github.com/Boshommi/grepai/embedder"
 	"github.com/Boshommi/grepai/indexer"
 	"github.com/Boshommi/grepai/store"
 	"github.com/Boshommi/grepai/trace"
@@ -50,6 +52,38 @@ func (e *countingEmbedder) Embed(ctx context.Context, text string) ([]float32, e
 func (e *countingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	e.embedBatchCalls++
 	return e.noOpEmbedder.EmbedBatch(ctx, texts)
+}
+
+type contextLimitProbeEmbedder struct {
+	maxChars        int
+	embedBatchCalls int
+}
+
+func (e *contextLimitProbeEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	return []float32{0.1, 0.2, 0.3}, nil
+}
+
+func (e *contextLimitProbeEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	e.embedBatchCalls++
+	for i, text := range texts {
+		if len(text) > e.maxChars {
+			return nil, embedder.NewContextLengthError(i, embedder.EstimateTokens(text), e.maxChars/4, "input exceeds context length")
+		}
+	}
+
+	vectors := make([][]float32, len(texts))
+	for i := range texts {
+		vectors[i] = []float32{0.1, 0.2, 0.3}
+	}
+	return vectors, nil
+}
+
+func (e *contextLimitProbeEmbedder) Dimensions() int {
+	return 3
+}
+
+func (e *contextLimitProbeEmbedder) Close() error {
+	return nil
 }
 
 func TestRunInitialScan_SkipsSymbolExtractionWhenContentHashMatches(t *testing.T) {
@@ -189,8 +223,44 @@ func TestRunInitialScan_SkipsIndexedFileByLastIndexTime(t *testing.T) {
 		t.Fatalf("expected real symbol extraction to be skipped, found %d symbols", len(realSymbols))
 	}
 
-	if emb.embedCalls != 0 || emb.embedBatchCalls != 0 {
-		t.Fatalf("expected no embedding calls for skipped startup path, got embed=%d embedBatch=%d", emb.embedCalls, emb.embedBatchCalls)
+	if emb.embedCalls != 0 || emb.embedBatchCalls != 1 {
+		t.Fatalf("expected only the startup probe batch call for skipped startup path, got embed=%d embedBatch=%d", emb.embedCalls, emb.embedBatchCalls)
+	}
+}
+
+func TestRunInitialScan_FailsFastWhenChunkSizeExceedsEmbedderContext(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+
+	srcPath := filepath.Join(projectRoot, "main.go")
+	srcContent := "package main\n\nfunc real() {}\n"
+	if err := os.WriteFile(srcPath, []byte(srcContent), 0644); err != nil {
+		t.Fatalf("failed to create source file: %v", err)
+	}
+
+	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+
+	emb := &contextLimitProbeEmbedder{maxChars: 700}
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	chunker := indexer.NewChunker(512, 50)
+	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
+	idx := indexer.NewIndexer(projectRoot, vecStore, emb, chunker, scanner, time.Time{})
+
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
+	defer symbolStore.Close()
+
+	_, err = runInitialScan(ctx, idx, scanner, trace.NewRegexExtractor(), symbolStore, []string{".go"}, time.Time{}, true, nil, nil)
+	if err == nil {
+		t.Fatal("expected runInitialScan to fail")
+	}
+	if emb.embedBatchCalls != 1 {
+		t.Fatalf("expected exactly one startup probe batch call, got %d", emb.embedBatchCalls)
+	}
+	if got := err.Error(); !strings.Contains(got, "configured chunking.size=512") {
+		t.Fatalf("expected chunk size hint in error, got %q", got)
 	}
 }
 

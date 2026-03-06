@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,6 +17,12 @@ const (
 	defaultLMStudioEndpoint = "http://127.0.0.1:1234"
 	defaultLMStudioModel    = "text-embedding-nomic-embed-text-v1.5"
 	lmStudioNomicDimensions = 768
+)
+
+var (
+	lmStudioInputTokensPattern   = regexp.MustCompile(`input\s*\((\d+)\s+tokens?\)`)
+	lmStudioMaxContextPattern    = regexp.MustCompile(`max context size\s*\((\d+)\s+tokens?\)`)
+	lmStudioPhysicalBatchPattern = regexp.MustCompile(`current batch size:\s*(\d+)`)
 )
 
 type LMStudioEmbedder struct {
@@ -111,12 +119,18 @@ func (e *LMStudioEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 
 	resp, err := e.client.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("failed to send request to LM Studio: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
@@ -127,18 +141,8 @@ func (e *LMStudioEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 			msg = errResp.Error.Message
 		}
 
-		// Check for context length error
-		// LM Studio may use various messages for context limit exceeded
-		if strings.Contains(msg, "context length") ||
-			strings.Contains(msg, "too many tokens") ||
-			strings.Contains(msg, "maximum context") {
-			// Estimate tokens from total input length
-			totalChars := 0
-			for _, t := range texts {
-				totalChars += len(t)
-			}
-			estimatedTokens := totalChars / 4
-			return nil, NewContextLengthError(0, estimatedTokens, 0, msg)
+		if ctxErr := parseLMStudioContextLengthError(msg, texts); ctxErr != nil {
+			return nil, ctxErr
 		}
 
 		return nil, fmt.Errorf("LM Studio returned status %d: %s", resp.StatusCode, msg)
@@ -187,4 +191,79 @@ func (e *LMStudioEmbedder) Ping(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func parseLMStudioContextLengthError(msg string, texts []string) *ContextLengthError {
+	normalized := strings.ToLower(msg)
+	if !strings.Contains(normalized, "context length") &&
+		!strings.Contains(normalized, "too many tokens") &&
+		!strings.Contains(normalized, "maximum context") &&
+		!strings.Contains(normalized, "max context size") &&
+		!strings.Contains(normalized, "too large to process") {
+		return nil
+	}
+
+	estimatedTokens := extractLMStudioTokenCount(lmStudioInputTokensPattern, normalized)
+	if estimatedTokens == 0 {
+		estimatedTokens = estimateLMStudioBatchTokens(texts)
+	}
+
+	maxTokens := extractLMStudioTokenCount(lmStudioMaxContextPattern, normalized)
+	if maxTokens == 0 {
+		maxTokens = extractLMStudioTokenCount(lmStudioPhysicalBatchPattern, normalized)
+	}
+
+	return NewContextLengthError(
+		estimateLMStudioFailedInputIndex(texts, maxTokens),
+		estimatedTokens,
+		maxTokens,
+		msg,
+	)
+}
+
+func extractLMStudioTokenCount(pattern *regexp.Regexp, msg string) int {
+	match := pattern.FindStringSubmatch(msg)
+	if len(match) < 2 {
+		return 0
+	}
+
+	value, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func estimateLMStudioBatchTokens(texts []string) int {
+	total := 0
+	for _, text := range texts {
+		total += EstimateTokens(text)
+	}
+	return total
+}
+
+func estimateLMStudioFailedInputIndex(texts []string, maxTokens int) int {
+	if len(texts) == 0 {
+		return 0
+	}
+
+	if maxTokens > 0 {
+		for i, text := range texts {
+			if EstimateTokens(text) > maxTokens {
+				return i
+			}
+		}
+	}
+
+	longestIndex := 0
+	longestTokens := EstimateTokens(texts[0])
+	for i := 1; i < len(texts); i++ {
+		tokens := EstimateTokens(texts[i])
+		if tokens > longestTokens {
+			longestTokens = tokens
+			longestIndex = i
+		}
+	}
+
+	return longestIndex
 }

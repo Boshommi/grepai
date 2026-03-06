@@ -740,6 +740,10 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		log.Println("Performing initial scan...")
 	}
 
+	if err := idx.PreflightEmbedding(ctx); err != nil {
+		return nil, err
+	}
+
 	var stats *indexer.IndexStats
 	var err error
 	if !isBackgroundChild {

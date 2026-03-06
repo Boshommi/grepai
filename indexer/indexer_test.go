@@ -1345,3 +1345,41 @@ func TestEmbedWithReChunking_ReChunksOnError(t *testing.T) {
 		t.Errorf("vectors count %d != chunks count %d", len(vectors), len(finalChunks))
 	}
 }
+
+func TestPreflightEmbedding_SucceedsForCompatibleChunkSize(t *testing.T) {
+	mockEmb := newMockContextLimitEmbedder(4000)
+	indexer := &Indexer{
+		root:     "/test",
+		store:    newMockStore(),
+		embedder: mockEmb,
+		chunker:  NewChunker(128, 16),
+	}
+
+	if err := indexer.PreflightEmbedding(context.Background()); err != nil {
+		t.Fatalf("PreflightEmbedding failed: %v", err)
+	}
+	if mockEmb.embedCallCount != 1 {
+		t.Fatalf("expected exactly one probe batch call, got %d", mockEmb.embedCallCount)
+	}
+}
+
+func TestPreflightEmbedding_FailsFastForOversizedChunkConfig(t *testing.T) {
+	mockEmb := newMockContextLimitEmbedder(700)
+	indexer := &Indexer{
+		root:     "/test",
+		store:    newMockStore(),
+		embedder: mockEmb,
+		chunker:  NewChunker(512, 50),
+	}
+
+	err := indexer.PreflightEmbedding(context.Background())
+	if err == nil {
+		t.Fatal("expected PreflightEmbedding to fail")
+	}
+	if !strings.Contains(err.Error(), "configured chunking.size=512") {
+		t.Fatalf("expected chunk size hint in error, got %q", err.Error())
+	}
+	if mockEmb.embedCallCount != 1 {
+		t.Fatalf("expected exactly one probe batch call, got %d", mockEmb.embedCallCount)
+	}
+}
