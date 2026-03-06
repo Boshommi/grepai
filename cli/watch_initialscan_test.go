@@ -56,10 +56,20 @@ func (e *countingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 
 type contextLimitProbeEmbedder struct {
 	maxChars        int
+	reportedMax     int
+	embedCalls      int
 	embedBatchCalls int
 }
 
 func (e *contextLimitProbeEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	e.embedCalls++
+	if len(text) > e.maxChars {
+		maxTokens := e.reportedMax
+		if maxTokens == 0 {
+			maxTokens = e.maxChars / 4
+		}
+		return nil, embedder.NewContextLengthError(0, embedder.EstimateTokens(text), maxTokens, "input exceeds context length")
+	}
 	return []float32{0.1, 0.2, 0.3}, nil
 }
 
@@ -67,7 +77,11 @@ func (e *contextLimitProbeEmbedder) EmbedBatch(ctx context.Context, texts []stri
 	e.embedBatchCalls++
 	for i, text := range texts {
 		if len(text) > e.maxChars {
-			return nil, embedder.NewContextLengthError(i, embedder.EstimateTokens(text), e.maxChars/4, "input exceeds context length")
+			maxTokens := e.reportedMax
+			if maxTokens == 0 {
+				maxTokens = e.maxChars / 4
+			}
+			return nil, embedder.NewContextLengthError(i, embedder.EstimateTokens(text), maxTokens, "input exceeds context length")
 		}
 	}
 
@@ -223,8 +237,8 @@ func TestRunInitialScan_SkipsIndexedFileByLastIndexTime(t *testing.T) {
 		t.Fatalf("expected real symbol extraction to be skipped, found %d symbols", len(realSymbols))
 	}
 
-	if emb.embedCalls != 0 || emb.embedBatchCalls != 1 {
-		t.Fatalf("expected only the startup probe batch call for skipped startup path, got embed=%d embedBatch=%d", emb.embedCalls, emb.embedBatchCalls)
+	if emb.embedCalls != 0 || emb.embedBatchCalls != 0 {
+		t.Fatalf("expected no startup compatibility probe for a non-representative sample, got embed=%d embedBatch=%d", emb.embedCalls, emb.embedBatchCalls)
 	}
 }
 
@@ -233,7 +247,7 @@ func TestRunInitialScan_FailsFastWhenChunkSizeExceedsEmbedderContext(t *testing.
 	projectRoot := t.TempDir()
 
 	srcPath := filepath.Join(projectRoot, "main.go")
-	srcContent := "package main\n\nfunc real() {}\n"
+	srcContent := strings.Repeat("x", 2000)
 	if err := os.WriteFile(srcPath, []byte(srcContent), 0644); err != nil {
 		t.Fatalf("failed to create source file: %v", err)
 	}
@@ -243,9 +257,9 @@ func TestRunInitialScan_FailsFastWhenChunkSizeExceedsEmbedderContext(t *testing.
 		t.Fatalf("failed to create ignore matcher: %v", err)
 	}
 
-	emb := &contextLimitProbeEmbedder{maxChars: 700}
+	emb := &contextLimitProbeEmbedder{maxChars: 700, reportedMax: 512}
 	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
-	chunker := indexer.NewChunker(512, 50)
+	chunker := indexer.NewChunker(256, 50)
 	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
 	idx := indexer.NewIndexer(projectRoot, vecStore, emb, chunker, scanner, time.Time{})
 
@@ -256,11 +270,20 @@ func TestRunInitialScan_FailsFastWhenChunkSizeExceedsEmbedderContext(t *testing.
 	if err == nil {
 		t.Fatal("expected runInitialScan to fail")
 	}
-	if emb.embedBatchCalls != 1 {
-		t.Fatalf("expected exactly one startup probe batch call, got %d", emb.embedBatchCalls)
+	if emb.embedCalls < 2 {
+		t.Fatalf("expected multiple startup compatibility probe calls, got %d", emb.embedCalls)
 	}
-	if got := err.Error(); !strings.Contains(got, "configured chunking.size=512") {
-		t.Fatalf("expected chunk size hint in error, got %q", got)
+	if got := err.Error(); !strings.Contains(got, "configured chunking.size=256") {
+		t.Fatalf("expected configured chunk size in error, got %q", got)
+	}
+	if got := err.Error(); !strings.Contains(got, "main.go") {
+		t.Fatalf("expected sampled file path in error, got %q", got)
+	}
+	if got := err.Error(); !strings.Contains(got, "highest tested passing size is 171") {
+		t.Fatalf("expected empirical safe size in error, got %q", got)
+	}
+	if strings.Contains(err.Error(), "try 255") || strings.Contains(err.Error(), "try 511") {
+		t.Fatalf("expected empirical recommendation instead of raw provider hint, got %q", err.Error())
 	}
 }
 

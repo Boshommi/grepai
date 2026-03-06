@@ -929,7 +929,7 @@ type watchSessionEventObserver func(projectRoot string, event watcher.FileEvent)
 
 const (
 	worktreeReconcileInterval = 3 * time.Second
-	sessionShutdownTimeout    = 2 * time.Second
+	sessionShutdownTimeout    = 10 * time.Second
 	maxSessionRetryBackoff    = 30 * time.Second
 )
 

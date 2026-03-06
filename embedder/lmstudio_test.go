@@ -51,3 +51,24 @@ func TestParseLMStudioContextLengthError_PhysicalBatchSize(t *testing.T) {
 		t.Fatalf("ChunkIndex = %d, want 0", err.ChunkIndex)
 	}
 }
+
+func TestParseLMStudioContextLengthError_MaximumContextVariant(t *testing.T) {
+	texts := []string{
+		"small",
+		strings.Repeat("x", 1500),
+	}
+
+	err := parseLMStudioContextLengthError(
+		"input exceeds the maximum context length for this model",
+		texts,
+	)
+	if err == nil {
+		t.Fatal("expected context length error")
+	}
+	if err.ChunkIndex != 1 {
+		t.Fatalf("ChunkIndex = %d, want 1", err.ChunkIndex)
+	}
+	if err.EstimatedTokens == 0 {
+		t.Fatal("expected estimated tokens to be populated")
+	}
+}

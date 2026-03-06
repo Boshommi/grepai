@@ -491,3 +491,53 @@ func TestDynamicWatch_ContextCancelRemainsGracefulUnderRace(t *testing.T) {
 		}
 	}
 }
+
+func TestDynamicWatch_ContextCancelDuringStartupDoesNotEmitShutdownTimeout(t *testing.T) {
+	mainRoot := canonicalPath("/tmp/main")
+	lifecycleCh := make(chan watchLifecycleEvent, 16)
+
+	runner := func(
+		ctx context.Context,
+		_ string,
+		_ embedder.Embedder,
+		_ bool,
+		_ func(),
+		_ watchSessionEventObserver,
+		_ func(current, total int, file string),
+		_ func(info indexer.BatchProgressInfo),
+		_ func(step string, current, total int),
+		_ watchActivityObserver,
+		_ watchStatsObserver,
+	) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runDynamicWatchSupervisor(
+			ctx,
+			mainRoot,
+			nil,
+			withWatchSupervisorSessionRunner(runner),
+			withWatchSupervisorLifecycleObserver(func(projectRoot, state, note string) {
+				lifecycleCh <- watchLifecycleEvent{projectRoot: projectRoot, state: state, note: note}
+			}),
+		)
+	}()
+
+	waitForWatchLifecycleState(t, lifecycleCh, mainRoot, "starting", time.Second)
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("expected graceful shutdown, got %v", err)
+	}
+
+	close(lifecycleCh)
+	for ev := range lifecycleCh {
+		if canonicalPath(ev.projectRoot) == mainRoot && ev.note == "shutdown timeout" {
+			t.Fatalf("unexpected shutdown timeout lifecycle event: %+v", ev)
+		}
+	}
+}

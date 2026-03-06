@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -129,12 +128,14 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 }
 
 const (
-	minScanWorkers       = 4
-	maxScanWorkers       = 16
-	pipelineBufferFactor = 2
-	batchWindowSize      = 8
-	batchFlushInterval   = 100 * time.Millisecond
-	embeddingProbeFile   = "grepai_preflight_probe.go"
+	minScanWorkers                   = 4
+	maxScanWorkers                   = 16
+	pipelineBufferFactor             = 2
+	batchWindowSize                  = 8
+	batchFlushInterval               = 100 * time.Millisecond
+	compatibilityProbeCandidateLimit = 16
+	compatibilityProbeMinChunkSize   = 16
+	compatibilityProbeMinTokens      = 64
 )
 
 type indexPipelineCounters struct {
@@ -177,9 +178,17 @@ type batchWindowResult struct {
 	windowErr error
 }
 
+type compatibilityProbeSample struct {
+	filePath string
+	content  string
+	tokens   int
+}
+
 func isContextCancellation(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
+
+var errStopCompatibilityProbe = errors.New("stop compatibility probe")
 
 func scanWorkerCount() int {
 	workers := runtime.GOMAXPROCS(0) * 2
@@ -1342,86 +1351,165 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkIn
 }
 
 func (idx *Indexer) PreflightEmbedding(ctx context.Context) error {
-	if idx.embedder == nil || idx.chunker == nil {
+	if idx.embedder == nil || idx.chunker == nil || idx.scanner == nil {
 		return nil
 	}
 
-	probe, ok := idx.buildEmbeddingProbeChunk()
+	sample, ok, err := idx.findCompatibilityProbeSample(ctx)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return nil
 	}
 
-	if _, err := idx.embedder.EmbedBatch(ctx, []string{probe.Content}); err != nil {
-		if isContextCancellation(err) || ctx.Err() != nil {
-			return err
+	if err := idx.probeChunkSize(ctx, sample, idx.chunker.ChunkSize()); err == nil {
+		return nil
+	} else if isContextCancellation(err) || ctx.Err() != nil {
+		return err
+	} else if ctxErr := embedder.AsContextLengthError(err); ctxErr != nil {
+		safeSize, searchErr := idx.findHighestPassingChunkSize(ctx, sample, idx.chunker.ChunkSize())
+		if searchErr != nil {
+			return searchErr
 		}
 
-		if ctxErr := embedder.AsContextLengthError(err); ctxErr != nil {
-			message := fmt.Sprintf(
-				"configured chunking.size=%d is incompatible with the embedding model context window",
-				idx.chunker.ChunkSize(),
-			)
-			if ctxErr.MaxTokens > 0 {
-				recommended := recommendedChunkSizeForLimit(idx.chunker.ChunkSize(), ctxErr.MaxTokens)
-				message = fmt.Sprintf("%s (provider limit is about %d tokens; try %d)", message, ctxErr.MaxTokens, recommended)
-			}
-			return fmt.Errorf("%s: %w", message, err)
+		message := fmt.Sprintf(
+			"configured chunking.size=%d is incompatible with embedding sample %s",
+			idx.chunker.ChunkSize(),
+			sample.filePath,
+		)
+		if safeSize > 0 {
+			message = fmt.Sprintf("%s; highest tested passing size is %d", message, safeSize)
+		} else {
+			message = fmt.Sprintf("%s; no passing size found down to %d", message, compatibilityProbeMinChunkSize)
 		}
-
-		return fmt.Errorf("embedding batch probe failed: %w", err)
+		if ctxErr.MaxTokens > 0 {
+			message = fmt.Sprintf("%s (provider reported limit about %d tokens)", message, ctxErr.MaxTokens)
+		}
+		return fmt.Errorf("%s: %w", message, err)
 	}
 
-	return nil
+	return fmt.Errorf("embedding compatibility probe failed for %s: %w", sample.filePath, err)
 }
 
-func (idx *Indexer) buildEmbeddingProbeChunk() (ChunkInfo, bool) {
-	if idx.chunker == nil {
+func (idx *Indexer) findCompatibilityProbeSample(ctx context.Context) (compatibilityProbeSample, bool, error) {
+	if idx.scanner == nil || idx.chunker == nil {
+		return compatibilityProbeSample{}, false, nil
+	}
+
+	threshold := idx.chunker.ChunkSize() * 3 / 4
+	if threshold < compatibilityProbeMinTokens {
+		threshold = compatibilityProbeMinTokens
+	}
+
+	scannedCandidates := 0
+	var best compatibilityProbeSample
+	var bestFound bool
+
+	err := idx.scanner.WalkMetadata(ctx, func(meta FileMeta) error {
+		file, err := idx.scanner.ScanFile(meta.Path)
+		if err != nil {
+			if isContextCancellation(err) || ctx.Err() != nil {
+				return err
+			}
+			return nil
+		}
+		if file == nil || file.Content == "" {
+			return nil
+		}
+
+		largestChunk, ok := largestChunkForContent(file.Path, file.Content, idx.chunker)
+		if !ok {
+			return nil
+		}
+
+		scannedCandidates++
+		tokens := embedder.EstimateTokens(largestChunk.Content)
+		if !bestFound || tokens > best.tokens {
+			best = compatibilityProbeSample{
+				filePath: file.Path,
+				content:  file.Content,
+				tokens:   tokens,
+			}
+			bestFound = true
+		}
+
+		if tokens >= threshold || scannedCandidates >= compatibilityProbeCandidateLimit {
+			return errStopCompatibilityProbe
+		}
+		return nil
+	}, nil)
+	if err != nil && !errors.Is(err, errStopCompatibilityProbe) {
+		if isContextCancellation(err) || ctx.Err() != nil {
+			return compatibilityProbeSample{}, false, err
+		}
+		return compatibilityProbeSample{}, false, fmt.Errorf("failed to collect embedding compatibility sample: %w", err)
+	}
+
+	if !bestFound || best.tokens < threshold {
+		return compatibilityProbeSample{}, false, nil
+	}
+
+	return best, true, nil
+}
+
+func largestChunkForContent(filePath, content string, chunker *Chunker) (ChunkInfo, bool) {
+	if chunker == nil {
 		return ChunkInfo{}, false
 	}
 
-	tokenCount := idx.chunker.ChunkSize()
-	if tokenCount < 32 {
-		tokenCount = 32
+	chunks := chunker.ChunkWithContext(filePath, content)
+	if len(chunks) == 0 {
+		return ChunkInfo{}, false
 	}
 
-	var builder strings.Builder
-	builder.WriteString("File: ")
-	builder.WriteString(embeddingProbeFile)
-	builder.WriteString("\n\n")
-	for i := 0; i < tokenCount; i++ {
-		builder.WriteString("tok")
-		builder.WriteString(fmt.Sprintf("%03d", i))
-		builder.WriteString(" ")
+	largest := chunks[0]
+	largestTokens := embedder.EstimateTokens(largest.Content)
+	for _, chunk := range chunks[1:] {
+		tokens := embedder.EstimateTokens(chunk.Content)
+		if tokens > largestTokens {
+			largest = chunk
+			largestTokens = tokens
+		}
 	}
 
-	return ChunkInfo{
-		FilePath: embeddingProbeFile,
-		Content:  builder.String(),
-	}, true
+	return largest, true
 }
 
-func recommendedChunkSizeForLimit(currentChunkSize, maxTokens int) int {
-	if maxTokens <= 0 {
-		if currentChunkSize <= 64 {
-			return 32
-		}
-		return currentChunkSize / 2
+func (idx *Indexer) probeChunkSize(ctx context.Context, sample compatibilityProbeSample, chunkSize int) error {
+	probeChunker := NewChunker(chunkSize, idx.chunker.Overlap())
+	largestChunk, ok := largestChunkForContent(sample.filePath, sample.content, probeChunker)
+	if !ok {
+		return nil
 	}
 
-	recommended := (maxTokens * 3) / 4
-	if recommended < 32 {
-		recommended = maxTokens / 2
+	_, err := idx.embedder.Embed(ctx, largestChunk.Content)
+	return err
+}
+
+func (idx *Indexer) findHighestPassingChunkSize(ctx context.Context, sample compatibilityProbeSample, currentSize int) (int, error) {
+	low := compatibilityProbeMinChunkSize
+	high := currentSize - 1
+	best := 0
+
+	for low <= high {
+		mid := low + (high-low)/2
+		err := idx.probeChunkSize(ctx, sample, mid)
+		if err == nil {
+			best = mid
+			low = mid + 1
+			continue
+		}
+		if isContextCancellation(err) || ctx.Err() != nil {
+			return 0, err
+		}
+		if embedder.AsContextLengthError(err) == nil {
+			return 0, fmt.Errorf("embedding compatibility probe failed for %s at chunk size %d: %w", sample.filePath, mid, err)
+		}
+		high = mid - 1
 	}
-	if recommended < 16 {
-		recommended = 16
-	}
-	if recommended >= currentChunkSize {
-		recommended = currentChunkSize - 1
-	}
-	if recommended < 16 {
-		recommended = 16
-	}
-	return recommended
+
+	return best, nil
 }
 
 // RemoveFile removes a file from the index

@@ -1228,6 +1228,61 @@ func (m *mockContextLimitEmbedder) Close() error {
 	return nil
 }
 
+type mockHintedContextLimitEmbedder struct {
+	maxChars          int
+	reportedMaxTokens int
+	embedCallCount    int
+}
+
+func (m *mockHintedContextLimitEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	m.embedCallCount++
+	if len(text) > m.maxChars {
+		return nil, embedder.NewContextLengthError(0, embedder.EstimateTokens(text), m.reportedMaxTokens, "input exceeds context length")
+	}
+	return []float32{0.1, 0.2, 0.3}, nil
+}
+
+func (m *mockHintedContextLimitEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	m.embedCallCount++
+	vectors := make([][]float32, len(texts))
+	for i, text := range texts {
+		if len(text) > m.maxChars {
+			return nil, embedder.NewContextLengthError(i, embedder.EstimateTokens(text), m.reportedMaxTokens, "input exceeds context length")
+		}
+		vectors[i] = []float32{0.1, 0.2, 0.3}
+	}
+	return vectors, nil
+}
+
+func (m *mockHintedContextLimitEmbedder) Dimensions() int {
+	return 3
+}
+
+func (m *mockHintedContextLimitEmbedder) Close() error {
+	return nil
+}
+
+func newProbeScanner(path, content string) *Scanner {
+	return &Scanner{
+		walkMetadata: func(ctx context.Context, onFile func(FileMeta) error, onSkipped func(string)) error {
+			return onFile(FileMeta{
+				Path:    path,
+				Size:    int64(len(content)),
+				ModTime: 1,
+			})
+		},
+		scanFile: func(relPath string) (*FileInfo, error) {
+			return &FileInfo{
+				Path:    relPath,
+				Size:    int64(len(content)),
+				ModTime: 1,
+				Hash:    "hash",
+				Content: content,
+			}, nil
+		},
+	}
+}
+
 // TestIndexFile_ReChunkOnContextLengthError tests that files with large chunks are re-chunked
 func TestIndexFile_ReChunkOnContextLengthError(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -1345,41 +1400,73 @@ func TestEmbedWithReChunking_ReChunksOnError(t *testing.T) {
 	}
 }
 
-func TestPreflightEmbedding_SucceedsForCompatibleChunkSize(t *testing.T) {
-	mockEmb := newMockContextLimitEmbedder(4000)
+func TestPreflightEmbedding_UsesRealSampleAndDoesNotFalseFail(t *testing.T) {
+	mockEmb := newMockContextLimitEmbedder(1200)
 	indexer := &Indexer{
 		root:     "/test",
 		store:    newMockStore(),
 		embedder: mockEmb,
-		chunker:  NewChunker(128, 16),
+		chunker:  NewChunker(256, 16),
+		scanner:  newProbeScanner("main.go", strings.Repeat("x", 2000)),
 	}
 
 	if err := indexer.PreflightEmbedding(context.Background()); err != nil {
 		t.Fatalf("PreflightEmbedding failed: %v", err)
 	}
 	if mockEmb.embedCallCount != 1 {
-		t.Fatalf("expected exactly one probe batch call, got %d", mockEmb.embedCallCount)
+		t.Fatalf("expected exactly one compatibility probe call, got %d", mockEmb.embedCallCount)
 	}
 }
 
-func TestPreflightEmbedding_FailsFastForOversizedChunkConfig(t *testing.T) {
-	mockEmb := newMockContextLimitEmbedder(700)
+func TestPreflightEmbedding_SkipsWhenNoRepresentativeSampleFound(t *testing.T) {
+	mockEmb := newMockContextLimitEmbedder(100)
 	indexer := &Indexer{
 		root:     "/test",
 		store:    newMockStore(),
 		embedder: mockEmb,
 		chunker:  NewChunker(512, 50),
+		scanner:  newProbeScanner("main.go", "package main\n\nfunc main() {}\n"),
+	}
+
+	if err := indexer.PreflightEmbedding(context.Background()); err != nil {
+		t.Fatalf("PreflightEmbedding failed: %v", err)
+	}
+	if mockEmb.embedCallCount != 0 {
+		t.Fatalf("expected no compatibility probe calls for non-representative sample, got %d", mockEmb.embedCallCount)
+	}
+}
+
+func TestPreflightEmbedding_FailsFastForOversizedChunkConfig(t *testing.T) {
+	mockEmb := &mockHintedContextLimitEmbedder{
+		maxChars:          700,
+		reportedMaxTokens: 512,
+	}
+	indexer := &Indexer{
+		root:     "/test",
+		store:    newMockStore(),
+		embedder: mockEmb,
+		chunker:  NewChunker(256, 50),
+		scanner:  newProbeScanner("main.go", strings.Repeat("x", 2000)),
 	}
 
 	err := indexer.PreflightEmbedding(context.Background())
 	if err == nil {
 		t.Fatal("expected PreflightEmbedding to fail")
 	}
-	if !strings.Contains(err.Error(), "configured chunking.size=512") {
-		t.Fatalf("expected chunk size hint in error, got %q", err.Error())
+	if !strings.Contains(err.Error(), "configured chunking.size=256") {
+		t.Fatalf("expected configured chunk size in error, got %q", err.Error())
 	}
-	if mockEmb.embedCallCount != 1 {
-		t.Fatalf("expected exactly one probe batch call, got %d", mockEmb.embedCallCount)
+	if !strings.Contains(err.Error(), "main.go") {
+		t.Fatalf("expected sample file path in error, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "highest tested passing size is 171") {
+		t.Fatalf("expected empirical safe size in error, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "try 255") || strings.Contains(err.Error(), "try 511") {
+		t.Fatalf("expected empirical recommendation instead of raw provider hint, got %q", err.Error())
+	}
+	if mockEmb.embedCallCount < 2 {
+		t.Fatalf("expected multiple compatibility probe calls, got %d", mockEmb.embedCallCount)
 	}
 }
 
