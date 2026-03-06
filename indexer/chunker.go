@@ -4,8 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Boshommi/grepai/embedder"
 )
 
 const (
@@ -182,20 +185,39 @@ func (c *Chunker) ReChunk(parent ChunkInfo, parentIndex int) []ChunkInfo {
 		return nil
 	}
 
-	// Use half the original chunk size for re-chunking
-	halfSize := c.chunkSize / 2
-	if halfSize < 64 {
-		halfSize = 64 // Minimum reasonable chunk size
+	// Shrink relative to the current chunk content, not just the original configuration.
+	// This keeps repeated retries making progress for providers with very small limits.
+	parentTokens := embedder.EstimateTokens(content)
+	prefixTokens := 0
+	if hasContext {
+		prefixTokens = embedder.EstimateTokens(filePrefix)
 	}
-	halfOverlap := c.overlap / 2
+	targetSize := int(math.Ceil(float64(parentTokens)/2)) - prefixTokens
+	if targetSize <= 0 {
+		targetSize = c.chunkSize / 2
+	}
+	if targetSize >= c.chunkSize {
+		targetSize = c.chunkSize / 2
+	}
+	if targetSize < 16 {
+		targetSize = 16
+	}
+
+	targetOverlap := c.overlap / 2
+	if targetOverlap >= targetSize {
+		targetOverlap = targetSize / 8
+	}
+	if targetOverlap < 0 {
+		targetOverlap = 0
+	}
 
 	// Create a temporary chunker with smaller settings
-	subChunker := NewChunker(halfSize, halfOverlap)
+	subChunker := NewChunker(targetSize, targetOverlap)
 
 	// Build line index for the original chunk content
 	lineStarts := buildLineStarts(content)
-	maxChars := halfSize * CharsPerToken
-	overlapChars := halfOverlap * CharsPerToken
+	maxChars := subChunker.chunkSize * CharsPerToken
+	overlapChars := subChunker.overlap * CharsPerToken
 
 	var subChunks []ChunkInfo
 	subIndex := 0
@@ -263,8 +285,6 @@ func (c *Chunker) ReChunk(parent ChunkInfo, parentIndex int) []ChunkInfo {
 		nextPos = alignRuneBoundary(content, nextPos)
 		pos = nextPos
 	}
-
-	_ = subChunker // Mark as used (we might use it in the future for more complex scenarios)
 
 	return subChunks
 }

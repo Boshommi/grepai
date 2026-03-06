@@ -1240,68 +1240,75 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 // embedWithReChunking attempts to embed chunks, automatically re-chunking
 // any chunks that exceed the embedder's context limit.
 func (idx *Indexer) embedWithReChunking(ctx context.Context, chunks []ChunkInfo) ([][]float32, []ChunkInfo, error) {
-	currentChunks := chunks
-	var allVectors [][]float32
-	var finalChunks []ChunkInfo
-
-	for attempt := 0; attempt < maxReChunkAttempts; attempt++ {
-		contents := make([]string, len(currentChunks))
-		for i, c := range currentChunks {
-			contents[i] = c.Content
-		}
-
-		vectors, err := idx.embedder.EmbedBatch(ctx, contents)
-		if err == nil {
-			// Success! Append all results
-			allVectors = append(allVectors, vectors...)
-			finalChunks = append(finalChunks, currentChunks...)
-			return allVectors, finalChunks, nil
-		}
-
-		// Check if it's a context length error
-		ctxErr := embedder.AsContextLengthError(err)
-		if ctxErr == nil {
-			// Not a context length error, return the original error
-			return nil, nil, err
-		}
-
-		// Re-chunk the problematic chunk
-		failedIndex := ctxErr.ChunkIndex
-		if failedIndex < 0 || failedIndex >= len(currentChunks) {
-			return nil, nil, fmt.Errorf("invalid chunk index %d from context length error", failedIndex)
-		}
-
-		failedChunk := currentChunks[failedIndex]
-		log.Printf("Re-chunking %s chunk %d (attempt %d/%d): context limit exceeded",
-			failedChunk.FilePath, failedIndex, attempt+1, maxReChunkAttempts)
-
-		// Embed all chunks before the failed one (they should work)
-		if failedIndex > 0 {
-			beforeContents := make([]string, failedIndex)
-			for i := 0; i < failedIndex; i++ {
-				beforeContents[i] = currentChunks[i].Content
-			}
-			beforeVectors, err := idx.embedder.EmbedBatch(ctx, beforeContents)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to embed chunks before failed index: %w", err)
-			}
-			allVectors = append(allVectors, beforeVectors...)
-			finalChunks = append(finalChunks, currentChunks[:failedIndex]...)
-		}
-
-		// Re-chunk the failed chunk
-		subChunks := idx.chunker.ReChunk(failedChunk, failedIndex)
-		if len(subChunks) == 0 {
-			return nil, nil, fmt.Errorf("re-chunking produced no chunks for %s", failedChunk.FilePath)
-		}
-
-		log.Printf("Split chunk into %d sub-chunks", len(subChunks))
-
-		// Prepare for next iteration: sub-chunks + remaining chunks
-		currentChunks = append(subChunks, currentChunks[failedIndex+1:]...)
+	contents := make([]string, len(chunks))
+	for i, c := range chunks {
+		contents[i] = c.Content
 	}
 
-	return nil, nil, fmt.Errorf("exceeded maximum re-chunk attempts (%d) for file", maxReChunkAttempts)
+	vectors, err := idx.embedder.EmbedBatch(ctx, contents)
+	if err == nil {
+		return vectors, chunks, nil
+	}
+	if isContextCancellation(err) || ctx.Err() != nil {
+		return nil, nil, err
+	}
+	if embedder.AsContextLengthError(err) == nil {
+		return nil, nil, err
+	}
+
+	var allVectors [][]float32
+	var finalChunks []ChunkInfo
+	for i, chunk := range chunks {
+		chunkVectors, chunkInfos, err := idx.embedChunkWithReChunking(ctx, chunk, i, 1)
+		if err != nil {
+			return nil, nil, err
+		}
+		allVectors = append(allVectors, chunkVectors...)
+		finalChunks = append(finalChunks, chunkInfos...)
+	}
+
+	return allVectors, finalChunks, nil
+}
+
+func (idx *Indexer) embedChunkWithReChunking(ctx context.Context, chunk ChunkInfo, chunkIndex, attempt int) ([][]float32, []ChunkInfo, error) {
+	vector, err := idx.embedder.Embed(ctx, chunk.Content)
+	if err == nil {
+		return [][]float32{vector}, []ChunkInfo{chunk}, nil
+	}
+	if isContextCancellation(err) || ctx.Err() != nil {
+		return nil, nil, err
+	}
+	if embedder.AsContextLengthError(err) == nil {
+		return nil, nil, err
+	}
+	if attempt > maxReChunkAttempts {
+		return nil, nil, fmt.Errorf("exceeded maximum re-chunk attempts (%d) for file", maxReChunkAttempts)
+	}
+
+	log.Printf("Re-chunking %s chunk %d (attempt %d/%d): context limit exceeded",
+		chunk.FilePath, chunkIndex, attempt, maxReChunkAttempts)
+
+	subChunks := idx.chunker.ReChunk(chunk, chunkIndex)
+	if len(subChunks) == 0 {
+		return nil, nil, fmt.Errorf("re-chunking produced no chunks for %s", chunk.FilePath)
+	}
+
+	log.Printf("Split chunk into %d sub-chunks", len(subChunks))
+
+	var (
+		allVectors [][]float32
+		allChunks  []ChunkInfo
+	)
+	for subIndex, subChunk := range subChunks {
+		subVectors, finalSubChunks, err := idx.embedChunkWithReChunking(ctx, subChunk, subIndex, attempt+1)
+		if err != nil {
+			return nil, nil, err
+		}
+		allVectors = append(allVectors, subVectors...)
+		allChunks = append(allChunks, finalSubChunks...)
+	}
+
+	return allVectors, allChunks, nil
 }
 
 // lookupCachedEmbeddings checks if the store implements EmbeddingCache and returns
@@ -1372,24 +1379,25 @@ func (idx *Indexer) buildEmbeddingProbeChunk() (ChunkInfo, bool) {
 		return ChunkInfo{}, false
 	}
 
-	line := "func grepaiPreflightProbe() string { return \"semantic code search embedding probe\" }\n"
-	content := strings.Repeat(line, idx.chunker.ChunkSize())
-	if content == "" {
-		content = line
+	tokenCount := idx.chunker.ChunkSize()
+	if tokenCount < 32 {
+		tokenCount = 32
 	}
 
-	for attempt := 0; attempt < 4; attempt++ {
-		chunks := idx.chunker.ChunkWithContext(embeddingProbeFile, content)
-		if len(chunks) == 0 {
-			return ChunkInfo{}, false
-		}
-		if len(chunks[0].Content) >= idx.chunker.ChunkSize()*CharsPerToken || attempt == 3 {
-			return chunks[0], true
-		}
-		content += content
+	var builder strings.Builder
+	builder.WriteString("File: ")
+	builder.WriteString(embeddingProbeFile)
+	builder.WriteString("\n\n")
+	for i := 0; i < tokenCount; i++ {
+		builder.WriteString("tok")
+		builder.WriteString(fmt.Sprintf("%03d", i))
+		builder.WriteString(" ")
 	}
 
-	return ChunkInfo{}, false
+	return ChunkInfo{
+		FilePath: embeddingProbeFile,
+		Content:  builder.String(),
+	}, true
 }
 
 func recommendedChunkSizeForLimit(currentChunkSize, maxTokens int) int {

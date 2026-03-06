@@ -1312,7 +1312,6 @@ func TestEmbedWithReChunking_Success(t *testing.T) {
 func TestEmbedWithReChunking_ReChunksOnError(t *testing.T) {
 	// Create embedder that fails on content > 500 chars
 	mockEmb := newMockContextLimitEmbedder(500)
-	mockEmb.failOnce = true
 
 	mockStore := newMockStore()
 	chunker := NewChunker(256, 25)
@@ -1381,5 +1380,38 @@ func TestPreflightEmbedding_FailsFastForOversizedChunkConfig(t *testing.T) {
 	}
 	if mockEmb.embedCallCount != 1 {
 		t.Fatalf("expected exactly one probe batch call, got %d", mockEmb.embedCallCount)
+	}
+}
+
+func TestEmbedWithReChunking_RecursivelyShrinksChunks(t *testing.T) {
+	mockEmb := newMockContextLimitEmbedder(400)
+	chunker := NewChunker(512, 50)
+
+	indexer := &Indexer{
+		root:     "/test",
+		store:    newMockStore(),
+		embedder: mockEmb,
+		chunker:  chunker,
+	}
+
+	chunks := []ChunkInfo{
+		{
+			ID:        "test.go_0",
+			FilePath:  "test.go",
+			Content:   "File: test.go\n\n" + strings.Repeat("abcdefgh ", 350),
+			StartLine: 1,
+			EndLine:   200,
+		},
+	}
+
+	vectors, finalChunks, err := indexer.embedWithReChunking(context.Background(), chunks)
+	if err != nil {
+		t.Fatalf("embedWithReChunking failed: %v", err)
+	}
+	if len(finalChunks) <= 1 {
+		t.Fatalf("expected chunk to be recursively split, got %d final chunks", len(finalChunks))
+	}
+	if len(vectors) != len(finalChunks) {
+		t.Fatalf("expected vectors to match final chunks, got %d vectors for %d chunks", len(vectors), len(finalChunks))
 	}
 }
