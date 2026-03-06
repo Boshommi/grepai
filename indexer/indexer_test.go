@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1245,6 +1246,53 @@ func TestIndexAllWithBatchProgress_NonBatchProgressMonotonic(t *testing.T) {
 		if progress[i] < progress[i-1] {
 			t.Fatalf("progress decreased: %d then %d", progress[i-1], progress[i])
 		}
+	}
+}
+
+func TestIndexAllWithBatchProgress_NonBatchDoesNotDeadlockWhenResultsBackUp(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+
+	const fileCount = 128
+	scanner.walkMetadata = func(ctx context.Context, onFile func(FileMeta) error, onSkipped func(string)) error {
+		for i := 0; i < fileCount; i++ {
+			if err := onFile(FileMeta{
+				Path:    fmt.Sprintf("file-%03d.go", i),
+				ModTime: time.Now().Unix(),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	scanner.scanFile = func(relPath string) (*FileInfo, error) {
+		return &FileInfo{
+			Path:    relPath,
+			ModTime: time.Now().Unix(),
+			Hash:    relPath,
+			Content: "package main\n\nfunc main() {}\n",
+		}, nil
+	}
+
+	mockStore := newMockStore()
+	mockEmb := newMockParallelEmbedder(1)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stats, err := indexer.IndexAllWithBatchProgress(ctx, nil, nil)
+	if err != nil {
+		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+	}
+	if stats.FilesIndexed != fileCount {
+		t.Fatalf("FilesIndexed = %d, want %d", stats.FilesIndexed, fileCount)
 	}
 }
 

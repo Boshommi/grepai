@@ -594,23 +594,52 @@ func (idx *Indexer) indexAllSequentialPipeline(
 	totalsKnown := false
 	preparedInput := preparedCh
 	resultInput := resultCh
+	maxPendingPrepared := cap(embedTasks)
+	if maxPendingPrepared < 1 {
+		maxPendingPrepared = 1
+	}
+	var (
+		pendingPrepared  []*preparedFile
+		nextEmbed        *preparedFile
+		embedOutput      chan<- *preparedFile
+		embedTasksClosed bool
+	)
 
-	for preparedOpen || resultsOpen {
+	for preparedOpen || resultsOpen || nextEmbed != nil || len(pendingPrepared) > 0 {
+		if nextEmbed == nil && len(pendingPrepared) > 0 {
+			nextEmbed = pendingPrepared[0]
+			embedOutput = embedTasks
+		} else if nextEmbed == nil {
+			embedOutput = nil
+		}
+
+		activePreparedInput := preparedInput
+		pendingCount := len(pendingPrepared)
+		if nextEmbed != nil {
+			pendingCount++
+		}
+		if pendingCount >= maxPendingPrepared {
+			activePreparedInput = nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case prepared, ok := <-preparedInput:
+		case prepared, ok := <-activePreparedInput:
 			if !ok {
 				preparedOpen = false
 				preparedInput = nil
 				totalsKnown = true
-				close(embedTasks)
 				if discoveredChunks > 0 {
 					emitBatchProgress(onBatchProgress, BatchProgressInfo{
 						CompletedChunks: completedChunks,
 						TotalChunks:     discoveredChunks,
 						KnownTotal:      true,
 					})
+				}
+				if nextEmbed == nil && len(pendingPrepared) == 0 && !embedTasksClosed {
+					close(embedTasks)
+					embedTasksClosed = true
 				}
 				continue
 			}
@@ -621,11 +650,16 @@ func (idx *Indexer) indexAllSequentialPipeline(
 				TotalChunks:     discoveredChunks,
 				KnownTotal:      false,
 			})
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case embedTasks <- prepared:
+			pendingPrepared = append(pendingPrepared, prepared)
+		case embedOutput <- nextEmbed:
+			if len(pendingPrepared) > 0 {
+				pendingPrepared = pendingPrepared[1:]
+			}
+			nextEmbed = nil
+			embedOutput = nil
+			if !preparedOpen && len(pendingPrepared) == 0 && !embedTasksClosed {
+				close(embedTasks)
+				embedTasksClosed = true
 			}
 		case result, ok := <-resultInput:
 			if !ok {
