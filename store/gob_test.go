@@ -204,6 +204,35 @@ func TestGOBStore_ListDocuments(t *testing.T) {
 	}
 }
 
+func TestGOBStore_ListDocumentSnapshots(t *testing.T) {
+	tmpDir := t.TempDir()
+	indexPath := filepath.Join(tmpDir, "index.gob")
+
+	store := NewGOBStore(indexPath)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := store.SaveDocument(ctx, Document{
+		Path:     "file1.go",
+		Hash:     "hash-1",
+		ModTime:  now,
+		ChunkIDs: []string{"c1", "c2"},
+	}); err != nil {
+		t.Fatalf("failed to save document: %v", err)
+	}
+
+	snapshots, err := store.ListDocumentSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("failed to list document snapshots: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshot count = %d, want 1", len(snapshots))
+	}
+	if snapshots[0].Path != "file1.go" || snapshots[0].Hash != "hash-1" || snapshots[0].ChunkCount != 2 {
+		t.Fatalf("unexpected snapshot: %+v", snapshots[0])
+	}
+}
+
 func TestCosineSimilarity(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -2,16 +2,48 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Boshommi/grepai/config"
 	"github.com/Boshommi/grepai/daemon"
+	"github.com/Boshommi/grepai/embedder"
 	"github.com/Boshommi/grepai/indexer"
 )
+
+type stubWatchEmbedder struct {
+	embedCalls atomic.Int32
+	embedErr   error
+}
+
+func (s *stubWatchEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	s.embedCalls.Add(1)
+	if s.embedErr != nil {
+		return nil, s.embedErr
+	}
+	return []float32{0.1, 0.2, 0.3}, nil
+}
+
+func (s *stubWatchEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	vectors := make([][]float32, len(texts))
+	for i := range texts {
+		vectors[i] = []float32{0.1, 0.2, 0.3}
+	}
+	return vectors, nil
+}
+
+func (s *stubWatchEmbedder) Dimensions() int {
+	return 3
+}
+
+func (s *stubWatchEmbedder) Close() error {
+	return nil
+}
 
 func withWatchGlobals(t *testing.T, workspace string, status, stop, background bool) {
 	t.Helper()
@@ -214,6 +246,59 @@ func TestInitializeEmbedderUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestInitializeEmbedder_PerformsPreflightEmbedding(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Embedder.Provider = "openrouter"
+	cfg.Embedder.APIKey = "test-key"
+	cfg.Embedder.Model = "openai/text-embedding-3-small"
+
+	stub := &stubWatchEmbedder{}
+	oldFactory := watchEmbedderFactory
+	watchEmbedderFactory = func(cfg *config.Config) (embedder.Embedder, error) {
+		return stub, nil
+	}
+	t.Cleanup(func() {
+		watchEmbedderFactory = oldFactory
+	})
+
+	emb, err := initializeEmbedder(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("initializeEmbedder() failed: %v", err)
+	}
+	defer emb.Close()
+
+	if stub.embedCalls.Load() != 1 {
+		t.Fatalf("expected exactly one preflight embedding request, got %d", stub.embedCalls.Load())
+	}
+}
+
+func TestInitializeEmbedder_FailsWhenPreflightEmbeddingFails(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Embedder.Provider = "openrouter"
+	cfg.Embedder.APIKey = "test-key"
+	cfg.Embedder.Model = "openai/text-embedding-3-small"
+
+	stub := &stubWatchEmbedder{embedErr: errors.New("boom")}
+	oldFactory := watchEmbedderFactory
+	watchEmbedderFactory = func(cfg *config.Config) (embedder.Embedder, error) {
+		return stub, nil
+	}
+	t.Cleanup(func() {
+		watchEmbedderFactory = oldFactory
+	})
+
+	_, err := initializeEmbedder(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("initializeEmbedder() should fail when preflight embedding fails")
+	}
+	if !strings.Contains(err.Error(), "embedding preflight failed") {
+		t.Fatalf("initializeEmbedder() error = %q, want message containing %q", err.Error(), "embedding preflight failed")
+	}
+	if stub.embedCalls.Load() != 1 {
+		t.Fatalf("expected exactly one preflight embedding request, got %d", stub.embedCalls.Load())
+	}
+}
+
 func TestInitializeStoreUnknownBackend(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Store.Backend = "unknown"
@@ -262,8 +347,8 @@ func TestIsTracedLanguage(t *testing.T) {
 }
 
 func TestPrintProgressAndBatchProgress(t *testing.T) {
-	printProgress(0, 0, "ignored")
-	printProgress(1, 2, filepath.Join("very", "long", "path", "to", "file.go"))
+	printProgress(indexer.ProgressInfo{Current: 0, Total: 0, CurrentFile: "ignored", KnownTotal: true})
+	printProgress(indexer.ProgressInfo{Current: 1, Total: 2, CurrentFile: filepath.Join("very", "long", "path", "to", "file.go"), KnownTotal: true})
 
 	printBatchProgress(indexer.BatchProgressInfo{
 		Retrying:   true,

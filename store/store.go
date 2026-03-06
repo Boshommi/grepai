@@ -26,6 +26,15 @@ type Document struct {
 	ChunkIDs []string  `json:"chunk_ids"`
 }
 
+// DocumentSnapshot contains the minimal file metadata needed for startup
+// indexing decisions without issuing per-file lookups.
+type DocumentSnapshot struct {
+	Path       string
+	Hash       string
+	ModTime    time.Time
+	ChunkCount int
+}
+
 // SearchResult represents a search match with its relevance score
 type SearchResult struct {
 	Chunk Chunk   `json:"chunk"`
@@ -106,4 +115,10 @@ type EmbeddingCache interface {
 	// LookupByContentHash returns the embedding vector for the given content hash.
 	// Returns (vector, true, nil) if found, (nil, false, nil) if not found.
 	LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error)
+}
+
+// DocumentSnapshotLister is an optional store capability for bulk-loading
+// document metadata used during initial indexing.
+type DocumentSnapshotLister interface {
+	ListDocumentSnapshots(ctx context.Context) ([]DocumentSnapshot, error)
 }

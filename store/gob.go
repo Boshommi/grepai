@@ -133,6 +133,23 @@ func (s *GOBStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return paths, nil
 }
 
+func (s *GOBStore) ListDocumentSnapshots(ctx context.Context) ([]DocumentSnapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snapshots := make([]DocumentSnapshot, 0, len(s.documents))
+	for _, doc := range s.documents {
+		snapshots = append(snapshots, DocumentSnapshot{
+			Path:       doc.Path,
+			Hash:       doc.Hash,
+			ModTime:    doc.ModTime,
+			ChunkCount: len(doc.ChunkIDs),
+		})
+	}
+
+	return snapshots, nil
+}
+
 func (s *GOBStore) Load(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

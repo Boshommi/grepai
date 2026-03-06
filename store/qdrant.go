@@ -11,6 +11,12 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
+const (
+	qdrantDocHashField    = "doc_hash"
+	qdrantDocModTimeField = "doc_mod_time"
+	qdrantScrollPageSize  = 1000
+)
+
 // sanitizeUTF8 ensures the string contains only valid UTF-8 characters.
 // Invalid sequences are replaced with the Unicode replacement character.
 func sanitizeUTF8(s string) string {
@@ -202,6 +208,67 @@ func (s *QdrantStore) buildChunkPayload(chunk Chunk) (map[string]*qdrant.Value, 
 	return payload, nil
 }
 
+func buildQdrantDocumentPayload(doc Document) (map[string]*qdrant.Value, error) {
+	payload := make(map[string]*qdrant.Value, 2)
+
+	hashVal, err := qdrant.NewValue(doc.Hash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create document hash value: %w", err)
+	}
+	modTimeVal, err := qdrant.NewValue(doc.ModTime.UTC().Format(time.RFC3339))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create document mod_time value: %w", err)
+	}
+
+	payload[qdrantDocHashField] = hashVal
+	payload[qdrantDocModTimeField] = modTimeVal
+	return payload, nil
+}
+
+func parseQdrantDocumentMetadata(payload map[string]*qdrant.Value) (hash string, modTime time.Time) {
+	if val, ok := payload[qdrantDocHashField]; ok {
+		hash = val.GetStringValue()
+	}
+	if val, ok := payload[qdrantDocModTimeField]; ok {
+		t, err := time.Parse(time.RFC3339, val.GetStringValue())
+		if err == nil {
+			modTime = t
+		}
+	}
+	return hash, modTime
+}
+
+func (s *QdrantStore) scrollAll(
+	ctx context.Context,
+	filter *qdrant.Filter,
+	withPayload *qdrant.WithPayloadSelector,
+	withVectors *qdrant.WithVectorsSelector,
+) ([]*qdrant.RetrievedPoint, error) {
+	var (
+		points []*qdrant.RetrievedPoint
+		offset *qdrant.PointId
+	)
+
+	for {
+		page, nextOffset, err := s.client.ScrollAndOffset(ctx, &qdrant.ScrollPoints{
+			CollectionName: s.collectionName,
+			Filter:         filter,
+			Offset:         offset,
+			Limit:          qdrant.PtrOf(uint32(qdrantScrollPageSize)),
+			WithPayload:    withPayload,
+			WithVectors:    withVectors,
+		})
+		if err != nil {
+			return nil, err
+		}
+		points = append(points, page...)
+		if nextOffset == nil || len(page) == 0 {
+			return points, nil
+		}
+		offset = nextOffset
+	}
+}
+
 func (s *QdrantStore) DeleteByFile(ctx context.Context, filePath string) error {
 	filter := &qdrant.Filter{
 		Must: []*qdrant.Condition{
@@ -311,12 +378,7 @@ func (s *QdrantStore) GetDocument(ctx context.Context, filePath string) (*Docume
 		},
 	}
 
-	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: s.collectionName,
-		Filter:         filter,
-		Limit:          qdrant.PtrOf(uint32(1)),
-		WithPayload:    qdrant.NewWithPayloadInclude("chunk_ids"),
-	})
+	scrollResult, err := s.scrollAll(ctx, filter, qdrant.NewWithPayloadInclude("file_path", qdrantDocHashField, qdrantDocModTimeField), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get document: %w", err)
 	}
@@ -325,15 +387,37 @@ func (s *QdrantStore) GetDocument(ctx context.Context, filePath string) (*Docume
 		return nil, nil
 	}
 
+	hash, modTime := parseQdrantDocumentMetadata(scrollResult[0].Payload)
 	doc := &Document{
 		Path:     filePath,
-		ChunkIDs: []string{},
+		Hash:     hash,
+		ModTime:  modTime,
+		ChunkIDs: make([]string, len(scrollResult)),
 	}
 
 	return doc, nil
 }
 
 func (s *QdrantStore) SaveDocument(ctx context.Context, doc Document) error {
+	payload, err := buildQdrantDocumentPayload(doc)
+	if err != nil {
+		return err
+	}
+
+	filter := &qdrant.Filter{
+		Must: []*qdrant.Condition{
+			qdrant.NewMatch("file_path", doc.Path),
+		},
+	}
+
+	_, err = s.client.SetPayload(ctx, &qdrant.SetPayloadPoints{
+		CollectionName: s.collectionName,
+		Payload:        payload,
+		PointsSelector: qdrant.NewPointsSelectorFilter(filter),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set document payload: %w", err)
+	}
 	return nil
 }
 
@@ -342,11 +426,7 @@ func (s *QdrantStore) DeleteDocument(ctx context.Context, filePath string) error
 }
 
 func (s *QdrantStore) ListDocuments(ctx context.Context) ([]string, error) {
-	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: s.collectionName,
-		Limit:          qdrant.PtrOf(uint32(1000)),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path"),
-	})
+	scrollResult, err := s.scrollAll(ctx, nil, qdrant.NewWithPayloadInclude("file_path"), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list documents: %w", err)
 	}
@@ -364,6 +444,42 @@ func (s *QdrantStore) ListDocuments(ctx context.Context) ([]string, error) {
 	}
 
 	return paths, nil
+}
+
+func (s *QdrantStore) ListDocumentSnapshots(ctx context.Context) ([]DocumentSnapshot, error) {
+	scrollResult, err := s.scrollAll(ctx, nil, qdrant.NewWithPayloadInclude("file_path", qdrantDocHashField, qdrantDocModTimeField), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list document snapshots: %w", err)
+	}
+
+	byPath := make(map[string]*DocumentSnapshot)
+	for _, point := range scrollResult {
+		filePath := ""
+		if val, ok := point.Payload["file_path"]; ok {
+			filePath = val.GetStringValue()
+		}
+		if filePath == "" {
+			continue
+		}
+
+		snapshot, ok := byPath[filePath]
+		if !ok {
+			hash, modTime := parseQdrantDocumentMetadata(point.Payload)
+			snapshot = &DocumentSnapshot{
+				Path:    filePath,
+				Hash:    hash,
+				ModTime: modTime,
+			}
+			byPath[filePath] = snapshot
+		}
+		snapshot.ChunkCount++
+	}
+
+	snapshots := make([]DocumentSnapshot, 0, len(byPath))
+	for _, snapshot := range byPath {
+		snapshots = append(snapshots, *snapshot)
+	}
+	return snapshots, nil
 }
 
 func (s *QdrantStore) Load(ctx context.Context) error {
@@ -400,11 +516,7 @@ func (s *QdrantStore) GetStats(ctx context.Context) (*IndexStats, error) {
 }
 
 func (s *QdrantStore) ListFilesWithStats(ctx context.Context) ([]FileStats, error) {
-	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: s.collectionName,
-		Limit:          qdrant.PtrOf(uint32(10000)),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line"),
-	})
+	scrollResult, err := s.scrollAll(ctx, nil, qdrant.NewWithPayloadInclude("file_path", qdrantDocModTimeField), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list files: %w", err)
 	}
@@ -421,10 +533,14 @@ func (s *QdrantStore) ListFilesWithStats(ctx context.Context) ([]FileStats, erro
 		}
 
 		if _, exists := fileStats[filePath]; !exists {
+			_, modTime := parseQdrantDocumentMetadata(point.Payload)
+			if modTime.IsZero() {
+				modTime = time.Now()
+			}
 			fileStats[filePath] = &FileStats{
 				Path:       filePath,
 				ChunkCount: 0,
-				ModTime:    time.Now(),
+				ModTime:    modTime,
 			}
 		}
 		fileStats[filePath].ChunkCount++
@@ -445,13 +561,12 @@ func (s *QdrantStore) GetChunksForFile(ctx context.Context, filePath string) ([]
 		},
 	}
 
-	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: s.collectionName,
-		Filter:         filter,
-		Limit:          qdrant.PtrOf(uint32(10000)),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at"),
-		WithVectors:    qdrant.NewWithVectors(true),
-	})
+	scrollResult, err := s.scrollAll(
+		ctx,
+		filter,
+		qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at", "content_hash"),
+		qdrant.NewWithVectors(true),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get chunks: %w", err)
 	}
@@ -471,12 +586,12 @@ func (s *QdrantStore) GetChunksForFile(ctx context.Context, filePath string) ([]
 }
 
 func (s *QdrantStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
-	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: s.collectionName,
-		Limit:          qdrant.PtrOf(uint32(100000)),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at"),
-		WithVectors:    qdrant.NewWithVectors(true),
-	})
+	scrollResult, err := s.scrollAll(
+		ctx,
+		nil,
+		qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at", "content_hash"),
+		qdrant.NewWithVectors(true),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get all chunks: %w", err)
 	}

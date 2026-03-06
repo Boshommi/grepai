@@ -43,11 +43,13 @@ type watchUIScanMsg struct {
 	current int
 	total   int
 	file    string
+	known   bool
 }
 
 type watchUIEmbedMsg struct {
 	completed int
 	total     int
+	known     bool
 	retrying  bool
 	attempt   int
 	status    int
@@ -238,14 +240,14 @@ func (m watchUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentStep = msg.current
 
 	case watchUIScanMsg:
-		m.progress.setScanProgress(msg.current, msg.total)
+		m.progress.setScanProgress(msg.current, msg.total, msg.known)
 		m.scanFile = msg.file
 		if msg.total > 0 {
 			m.currentStep = 1
 		}
 
 	case watchUIEmbedMsg:
-		m.progress.setEmbedProgress(msg.completed, msg.total)
+		m.progress.setEmbedProgress(msg.completed, msg.total, msg.known)
 		if msg.total > 0 {
 			m.currentStep = 2
 		}
@@ -1188,6 +1190,7 @@ func runWatchUIWorker(ctx context.Context, p *tea.Program) (err error) {
 				current: current,
 				total:   total,
 				file:    file,
+				known:   file == "" && total > 0,
 			})
 			if total > 0 && current < total {
 				p.Send(watchUIPhaseMsg{current: 1}) // Scanning
@@ -1197,6 +1200,7 @@ func runWatchUIWorker(ctx context.Context, p *tea.Program) (err error) {
 			p.Send(watchUIEmbedMsg{
 				completed: info.CompletedChunks,
 				total:     info.TotalChunks,
+				known:     info.KnownTotal,
 			})
 			if info.TotalChunks > 0 && info.CompletedChunks < info.TotalChunks {
 				p.Send(watchUIPhaseMsg{current: 2}) // Embedding

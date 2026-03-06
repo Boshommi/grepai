@@ -131,8 +131,8 @@ func TestIndexAllWithProgress_BinaryFileSkippedAfterMetadataPass(t *testing.T) {
 	if stats.FilesIndexed != 0 {
 		t.Fatalf("expected 0 indexed files, got %d", stats.FilesIndexed)
 	}
-	if !mockStore.listDocsCalled {
-		t.Fatal("expected ListDocuments to be called")
+	if !mockStore.listSnapsCalled {
+		t.Fatal("expected ListDocumentSnapshots to be called")
 	}
 	if mockEmbedder.embedCalled {
 		t.Fatal("expected embedder to not be called for binary file")

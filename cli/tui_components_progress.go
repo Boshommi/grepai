@@ -16,9 +16,11 @@ type progressModel struct {
 
 	scanCurrent int
 	scanTotal   int
+	scanKnown   bool
 
 	embedCurrent int
 	embedTotal   int
+	embedKnown   bool
 
 	rpgNodeStep    string
 	rpgNodeCurrent int
@@ -78,14 +80,16 @@ func (m *progressModel) setSize(w int) {
 	m.rpgEdgeBar.Width = available
 }
 
-func (m *progressModel) setScanProgress(current, total int) {
+func (m *progressModel) setScanProgress(current, total int, known bool) {
 	m.scanCurrent = current
 	m.scanTotal = total
+	m.scanKnown = known
 }
 
-func (m *progressModel) setEmbedProgress(current, total int) {
+func (m *progressModel) setEmbedProgress(current, total int, known bool) {
 	m.embedCurrent = current
 	m.embedTotal = total
+	m.embedKnown = known
 }
 
 func (m *progressModel) setRPGNodeProgress(step string, current, total int) {
@@ -102,17 +106,23 @@ func (m *progressModel) setRPGEdgeProgress(step string, current, total int) {
 
 func (m progressModel) View() string {
 	scanPct := 0.0
-	if m.scanTotal > 0 {
+	if m.scanKnown && m.scanTotal > 0 {
 		scanPct = float64(m.scanCurrent) / float64(m.scanTotal)
 	}
 
 	embedPct := 0.0
-	if m.embedTotal > 0 {
+	if m.embedKnown && m.embedTotal > 0 {
 		embedPct = float64(m.embedCurrent) / float64(m.embedTotal)
 	}
 
-	scanStatus := fmt.Sprintf("%d/%d", m.scanCurrent, m.scanTotal)
-	embedStatus := fmt.Sprintf("%d/%d", m.embedCurrent, m.embedTotal)
+	scanStatus := fmt.Sprintf("%d discovered", m.scanCurrent)
+	if m.scanKnown {
+		scanStatus = fmt.Sprintf("%d/%d", m.scanCurrent, m.scanTotal)
+	}
+	embedStatus := fmt.Sprintf("%d/%d discovered", m.embedCurrent, m.embedTotal)
+	if m.embedKnown {
+		embedStatus = fmt.Sprintf("%d/%d", m.embedCurrent, m.embedTotal)
+	}
 
 	rpgNodePct := 0.0
 	if m.rpgNodeTotal > 0 {

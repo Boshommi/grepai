@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Boshommi/grepai/embedder"
@@ -32,6 +35,7 @@ type ProgressInfo struct {
 	Current     int    // Current file number (1-indexed)
 	Total       int    // Total number of files
 	CurrentFile string // Path of current file being processed
+	KnownTotal  bool   // Whether Total is final and percentage-safe
 }
 
 // ProgressCallback is called for each file during indexing
@@ -43,6 +47,7 @@ type BatchProgressInfo struct {
 	TotalBatches    int  // Total number of batches
 	CompletedChunks int  // Number of chunks completed so far
 	TotalChunks     int  // Total number of chunks to embed
+	KnownTotal      bool // Whether TotalChunks/TotalBatches are final
 	Retrying        bool // True if this is a retry attempt
 	Attempt         int  // Retry attempt number (1-indexed, 0 if not retrying)
 	StatusCode      int  // HTTP status code when retrying (429 = rate limited, 5xx = server error)
@@ -85,117 +90,27 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	start := time.Now()
 	stats := &IndexStats{}
 
-	// Scan all files (metadata-only first pass)
-	fileMetas, skipped, err := idx.scanner.ScanMetadata()
+	snapshots, err := idx.loadDocumentSnapshots(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to scan files: %w", err)
+		return nil, fmt.Errorf("failed to load document snapshots: %w", err)
 	}
-	stats.FilesSkipped = len(skipped)
-
-	// Get existing documents
-	existingDocs, err := idx.store.ListDocuments(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list documents: %w", err)
+	remainingDocs := make(map[string]bool, len(snapshots))
+	for path := range snapshots {
+		remainingDocs[path] = true
 	}
 
-	existingMap := make(map[string]bool)
-	for _, doc := range existingDocs {
-		existingMap[doc] = true
-	}
-
-	// Filter files that need indexing
-	filesToIndex := make([]FileInfo, 0, len(fileMetas))
-	for i, fileMeta := range fileMetas {
-		// Report progress for scanning phase
-		if onProgress != nil {
-			onProgress(ProgressInfo{
-				Current:     i + 1,
-				Total:       len(fileMetas),
-				CurrentFile: fileMeta.Path,
-			})
-		}
-
-		// Fetch the document once — used by both the mod-time gate and hash check.
-		doc, err := idx.store.GetDocument(ctx, fileMeta.Path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get document %s: %w", fileMeta.Path, err)
-		}
-
-		// Skip files modified before lastIndexTime — but only if they have chunks.
-		// Files with no chunks need re-indexing even if their mod_time is old
-		// (e.g., a prior indexing run created the document but failed to embed).
-		if !idx.lastIndexTime.IsZero() && doc != nil && len(doc.ChunkIDs) > 0 {
-			fileModTime := time.Unix(fileMeta.ModTime, 0)
-			if fileModTime.Before(idx.lastIndexTime) || fileModTime.Equal(idx.lastIndexTime) {
-				stats.FilesSkipped++
-				delete(existingMap, fileMeta.Path)
-				continue
-			}
-		}
-
-		// Load file content and hash only after metadata filtering.
-		file, err := idx.scanner.ScanFile(fileMeta.Path)
-		if err != nil {
-			log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
-			stats.FilesSkipped++
-			delete(existingMap, fileMeta.Path)
-			continue
-		}
-		if file == nil {
-			stats.FilesSkipped++
-			delete(existingMap, fileMeta.Path)
-			continue
-		}
-
-		if doc != nil && doc.Hash == file.Hash && len(doc.ChunkIDs) > 0 {
-			delete(existingMap, fileMeta.Path)
-			continue // File unchanged and has chunks
-		}
-
-		filesToIndex = append(filesToIndex, *file)
-		delete(existingMap, fileMeta.Path)
-	}
-
-	// Index files using batch processing if available, otherwise sequentially
-	if batchEmbedder, ok := idx.embedder.(embedder.BatchEmbedder); ok && len(filesToIndex) > 0 {
-		indexed, chunks, err := idx.indexFilesBatched(ctx, filesToIndex, batchEmbedder, onBatchProgress)
-		if err != nil {
+	counters := &indexPipelineCounters{}
+	if batchEmbedder, ok := idx.embedder.(embedder.BatchEmbedder); ok {
+		if err := idx.indexAllBatchPipeline(ctx, snapshots, remainingDocs, counters, onProgress, onBatchProgress, batchEmbedder); err != nil {
 			return nil, err
 		}
-		stats.FilesIndexed = indexed
-		stats.ChunksCreated = chunks
-	} else if len(filesToIndex) > 0 {
-		// Sequential indexing for non-batch embedders (e.g., Ollama)
-		total := len(filesToIndex)
-		for i, file := range filesToIndex {
-			if onBatchProgress != nil {
-				onBatchProgress(BatchProgressInfo{
-					BatchIndex:      i,
-					TotalBatches:    total,
-					CompletedChunks: i,
-					TotalChunks:     total,
-				})
-			}
-			chunks, err := idx.IndexFile(ctx, file)
-			if err != nil {
-				log.Printf("Failed to index %s: %v", file.Path, err)
-				continue
-			}
-			stats.FilesIndexed++
-			stats.ChunksCreated += chunks
-		}
-		if onBatchProgress != nil {
-			onBatchProgress(BatchProgressInfo{
-				BatchIndex:      total,
-				TotalBatches:    total,
-				CompletedChunks: total,
-				TotalChunks:     total,
-			})
+	} else {
+		if err := idx.indexAllSequentialPipeline(ctx, snapshots, remainingDocs, counters, onProgress, onBatchProgress); err != nil {
+			return nil, err
 		}
 	}
 
-	// Remove deleted files
-	for path := range existingMap {
+	for path := range remainingDocs {
 		if err := idx.RemoveFile(ctx, path); err != nil {
 			log.Printf("Failed to remove %s: %v", path, err)
 			continue
@@ -203,8 +118,740 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		stats.FilesRemoved++
 	}
 
+	stats.FilesIndexed = int(counters.filesIndexed.Load())
+	stats.FilesSkipped = int(counters.filesSkipped.Load())
+	stats.ChunksCreated = int(counters.chunksCreated.Load())
+
 	stats.Duration = time.Since(start)
 	return stats, nil
+}
+
+const (
+	minScanWorkers       = 4
+	maxScanWorkers       = 16
+	pipelineBufferFactor = 2
+	batchWindowSize      = 8
+	batchFlushInterval   = 100 * time.Millisecond
+)
+
+type indexPipelineCounters struct {
+	filesIndexed  atomic.Int64
+	filesSkipped  atomic.Int64
+	chunksCreated atomic.Int64
+}
+
+type fileScanTask struct {
+	meta             FileMeta
+	snapshot         store.DocumentSnapshot
+	hasSnapshot      bool
+	existingChunkCnt int
+}
+
+type preparedFile struct {
+	file             FileInfo
+	chunkInfos        []ChunkInfo
+	cachedVectors     map[int][]float32
+	uncachedChunks    []ChunkInfo
+	uncachedIndices   []int
+	existingChunkCnt  int
+}
+
+type batchFileState struct {
+	prepared  *preparedFile
+	vectors   [][]float32
+	remaining int
+}
+
+type batchWindowRequest struct {
+	windowIndex int
+	batches     []embedder.Batch
+	batchOffset int
+}
+
+type batchWindowResult struct {
+	request   batchWindowRequest
+	results   []embedder.BatchResult
+	windowErr error
+}
+
+func scanWorkerCount() int {
+	workers := runtime.GOMAXPROCS(0) * 2
+	if workers < minScanWorkers {
+		workers = minScanWorkers
+	}
+	if workers > maxScanWorkers {
+		workers = maxScanWorkers
+	}
+	return workers
+}
+
+func (idx *Indexer) loadDocumentSnapshots(ctx context.Context) (map[string]store.DocumentSnapshot, error) {
+	if lister, ok := idx.store.(store.DocumentSnapshotLister); ok {
+		snapshots, err := lister.ListDocumentSnapshots(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]store.DocumentSnapshot, len(snapshots))
+		for _, snapshot := range snapshots {
+			out[snapshot.Path] = snapshot
+		}
+		return out, nil
+	}
+
+	paths, err := idx.store.ListDocuments(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]store.DocumentSnapshot, len(paths))
+	for _, path := range paths {
+		doc, err := idx.store.GetDocument(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if doc == nil {
+			continue
+		}
+		out[path] = store.DocumentSnapshot{
+			Path:       doc.Path,
+			Hash:       doc.Hash,
+			ModTime:    doc.ModTime,
+			ChunkCount: len(doc.ChunkIDs),
+		}
+	}
+	return out, nil
+}
+
+func (idx *Indexer) shouldSkipByLastIndex(meta FileMeta, snapshot store.DocumentSnapshot, hasSnapshot bool) bool {
+	if idx.lastIndexTime.IsZero() || !hasSnapshot || snapshot.ChunkCount == 0 {
+		return false
+	}
+
+	fileModTime := time.Unix(meta.ModTime, 0)
+	return fileModTime.Before(idx.lastIndexTime) || fileModTime.Equal(idx.lastIndexTime)
+}
+
+func emitScanProgress(onProgress ProgressCallback, current, total int, file string, known bool) {
+	if onProgress == nil {
+		return
+	}
+	onProgress(ProgressInfo{
+		Current:     current,
+		Total:       total,
+		CurrentFile: file,
+		KnownTotal:  known,
+	})
+}
+
+func emitBatchProgress(onProgress BatchProgressCallback, info BatchProgressInfo) {
+	if onProgress == nil {
+		return
+	}
+	onProgress(info)
+}
+
+func (idx *Indexer) walkScanTasks(
+	ctx context.Context,
+	snapshots map[string]store.DocumentSnapshot,
+	remainingDocs map[string]bool,
+	counters *indexPipelineCounters,
+	onProgress ProgressCallback,
+	scanTasks chan<- fileScanTask,
+) error {
+	discovered := 0
+	err := idx.scanner.WalkMetadata(ctx, func(meta FileMeta) error {
+		discovered++
+		emitScanProgress(onProgress, discovered, discovered, meta.Path, false)
+
+		snapshot, hasSnapshot := snapshots[meta.Path]
+		delete(remainingDocs, meta.Path)
+		if idx.shouldSkipByLastIndex(meta, snapshot, hasSnapshot) {
+			counters.filesSkipped.Add(1)
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case scanTasks <- fileScanTask{
+			meta:             meta,
+			snapshot:         snapshot,
+			hasSnapshot:      hasSnapshot,
+			existingChunkCnt: snapshot.ChunkCount,
+		}:
+			return nil
+		}
+	}, func(_ string) {
+		counters.filesSkipped.Add(1)
+	})
+	if err != nil {
+		return err
+	}
+
+	emitScanProgress(onProgress, discovered, discovered, "", true)
+	return nil
+}
+
+func (idx *Indexer) scanAndPrepareTask(ctx context.Context, task fileScanTask) (*preparedFile, bool, error) {
+	file, err := idx.scanner.ScanFile(task.meta.Path)
+	if err != nil {
+		return nil, true, err
+	}
+	if file == nil {
+		return nil, true, nil
+	}
+
+	if task.hasSnapshot && task.snapshot.Hash != "" && task.snapshot.Hash == file.Hash && task.snapshot.ChunkCount > 0 {
+		return nil, false, nil
+	}
+
+	prepared, err := idx.prepareFileForIndexing(ctx, *file, task.existingChunkCnt)
+	if err != nil {
+		return nil, false, err
+	}
+	return prepared, false, nil
+}
+
+func (idx *Indexer) prepareFileForIndexing(ctx context.Context, file FileInfo, existingChunkCnt int) (*preparedFile, error) {
+	chunkInfos := idx.chunker.ChunkWithContext(file.Path, file.Content)
+	if len(chunkInfos) == 0 {
+		return &preparedFile{
+			file:            file,
+			existingChunkCnt: existingChunkCnt,
+		}, nil
+	}
+
+	cachedVectors, cacheHits := idx.lookupCachedEmbeddings(ctx, chunkInfos)
+	if cacheHits > 0 {
+		log.Printf("Reused %d cached embeddings for %s", cacheHits, file.Path)
+	}
+
+	prepared := &preparedFile{
+		file:            file,
+		chunkInfos:      chunkInfos,
+		cachedVectors:   cachedVectors,
+		existingChunkCnt: existingChunkCnt,
+	}
+
+	for i, chunk := range chunkInfos {
+		if _, ok := cachedVectors[i]; ok {
+			continue
+		}
+		prepared.uncachedIndices = append(prepared.uncachedIndices, i)
+		prepared.uncachedChunks = append(prepared.uncachedChunks, chunk)
+	}
+
+	return prepared, nil
+}
+
+func (idx *Indexer) deleteExistingChunks(ctx context.Context, filePath string, existingChunkCnt int) error {
+	if existingChunkCnt <= 0 {
+		return nil
+	}
+	if err := idx.store.DeleteByFile(ctx, filePath); err != nil {
+		return fmt.Errorf("failed to delete existing chunks for %s: %w", filePath, err)
+	}
+	return nil
+}
+
+func (idx *Indexer) savePreparedFile(ctx context.Context, prepared *preparedFile, finalChunks []ChunkInfo, vectors [][]float32) (int, error) {
+	if err := idx.deleteExistingChunks(ctx, prepared.file.Path, prepared.existingChunkCnt); err != nil {
+		return 0, err
+	}
+	if len(finalChunks) == 0 {
+		return 0, nil
+	}
+
+	now := time.Now()
+	chunks, chunkIDs := createStoreChunks(finalChunks, vectors, now)
+	fd := fileChunkData{
+		file:       prepared.file,
+		chunkInfos: finalChunks,
+	}
+	if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
+		return 0, err
+	}
+	return len(chunks), nil
+}
+
+func (idx *Indexer) embedPreparedFileSequential(ctx context.Context, prepared *preparedFile) (int, int, error) {
+	if len(prepared.chunkInfos) == 0 {
+		if err := idx.deleteExistingChunks(ctx, prepared.file.Path, prepared.existingChunkCnt); err != nil {
+			return 0, 0, err
+		}
+		return 0, 0, nil
+	}
+
+	cacheHits := len(prepared.cachedVectors)
+	uncachedChunkCount := len(prepared.uncachedChunks)
+	if uncachedChunkCount == 0 {
+		vectors := make([][]float32, len(prepared.chunkInfos))
+		for i := range prepared.chunkInfos {
+			vectors[i] = prepared.cachedVectors[i]
+		}
+		chunksCreated, err := idx.savePreparedFile(ctx, prepared, prepared.chunkInfos, vectors)
+		return chunksCreated, uncachedChunkCount, err
+	}
+
+	uncachedVectors, finalUncachedChunks, err := idx.embedWithReChunking(ctx, prepared.uncachedChunks)
+	if err != nil {
+		return 0, uncachedChunkCount, fmt.Errorf("failed to embed chunks: %w", err)
+	}
+
+	var vectors [][]float32
+	var finalChunks []ChunkInfo
+
+	if cacheHits == 0 {
+		vectors = uncachedVectors
+		finalChunks = finalUncachedChunks
+	} else {
+		vectors = make([][]float32, 0, len(prepared.chunkInfos))
+		finalChunks = make([]ChunkInfo, 0, len(prepared.chunkInfos))
+
+		uncachedIdx := 0
+		for i, chunk := range prepared.chunkInfos {
+			if vec, ok := prepared.cachedVectors[i]; ok {
+				vectors = append(vectors, vec)
+				finalChunks = append(finalChunks, chunk)
+				continue
+			}
+			if uncachedIdx < len(uncachedVectors) && uncachedIdx < len(finalUncachedChunks) {
+				vectors = append(vectors, uncachedVectors[uncachedIdx])
+				finalChunks = append(finalChunks, finalUncachedChunks[uncachedIdx])
+				uncachedIdx++
+			}
+		}
+		for ; uncachedIdx < len(uncachedVectors); uncachedIdx++ {
+			vectors = append(vectors, uncachedVectors[uncachedIdx])
+			finalChunks = append(finalChunks, finalUncachedChunks[uncachedIdx])
+		}
+	}
+
+	chunksCreated, err := idx.savePreparedFile(ctx, prepared, finalChunks, vectors)
+	return chunksCreated, uncachedChunkCount, err
+}
+
+func (idx *Indexer) startPrepareWorkers(
+	ctx context.Context,
+	workers int,
+	scanTasks <-chan fileScanTask,
+	preparedCh chan<- *preparedFile,
+	counters *indexPipelineCounters,
+) *sync.WaitGroup {
+	var workerWG sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for task := range scanTasks {
+				prepared, countedSkip, err := idx.scanAndPrepareTask(ctx, task)
+				if err != nil {
+					log.Printf("Failed to scan %s: %v", task.meta.Path, err)
+					if countedSkip {
+						counters.filesSkipped.Add(1)
+					}
+					continue
+				}
+				if countedSkip {
+					counters.filesSkipped.Add(1)
+				}
+				if prepared == nil {
+					continue
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case preparedCh <- prepared:
+				}
+			}
+		}()
+	}
+	return &workerWG
+}
+
+func (idx *Indexer) indexAllSequentialPipeline(
+	ctx context.Context,
+	snapshots map[string]store.DocumentSnapshot,
+	remainingDocs map[string]bool,
+	counters *indexPipelineCounters,
+	onProgress ProgressCallback,
+	onBatchProgress BatchProgressCallback,
+) error {
+	workers := scanWorkerCount()
+	scanTasks := make(chan fileScanTask, workers*pipelineBufferFactor)
+	preparedCh := make(chan *preparedFile, workers*pipelineBufferFactor)
+	walkErrCh := make(chan error, 1)
+
+	go func() {
+		defer close(scanTasks)
+		walkErrCh <- idx.walkScanTasks(ctx, snapshots, remainingDocs, counters, onProgress, scanTasks)
+	}()
+
+	workerWG := idx.startPrepareWorkers(ctx, workers, scanTasks, preparedCh, counters)
+	go func() {
+		workerWG.Wait()
+		close(preparedCh)
+	}()
+
+	var (
+		discoveredChunks atomic.Int64
+		completedChunks  atomic.Int64
+	)
+
+	for prepared := range preparedCh {
+		discoveredChunks.Add(int64(len(prepared.uncachedChunks)))
+		emitBatchProgress(onBatchProgress, BatchProgressInfo{
+			CompletedChunks: int(completedChunks.Load()),
+			TotalChunks:     int(discoveredChunks.Load()),
+			KnownTotal:      false,
+		})
+
+		chunksCreated, embeddedChunks, err := idx.embedPreparedFileSequential(ctx, prepared)
+		if err != nil {
+			log.Printf("Failed to index %s: %v", prepared.file.Path, err)
+			continue
+		}
+		if chunksCreated > 0 {
+			counters.filesIndexed.Add(1)
+			counters.chunksCreated.Add(int64(chunksCreated))
+		}
+
+		if embeddedChunks > 0 {
+			completedChunks.Add(int64(embeddedChunks))
+		}
+		emitBatchProgress(onBatchProgress, BatchProgressInfo{
+			CompletedChunks: int(completedChunks.Load()),
+			TotalChunks:     int(discoveredChunks.Load()),
+			KnownTotal:      false,
+		})
+	}
+
+	walkErr := <-walkErrCh
+	if discoveredChunks.Load() > 0 {
+		emitBatchProgress(onBatchProgress, BatchProgressInfo{
+			CompletedChunks: int(completedChunks.Load()),
+			TotalChunks:     int(discoveredChunks.Load()),
+			KnownTotal:      true,
+		})
+	}
+	if walkErr != nil {
+		return fmt.Errorf("failed to scan files: %w", walkErr)
+	}
+	return nil
+}
+
+func reindexBatches(batches []embedder.Batch) []embedder.Batch {
+	if len(batches) == 0 {
+		return nil
+	}
+
+	reindexed := make([]embedder.Batch, len(batches))
+	for i, batch := range batches {
+		reindexed[i] = embedder.Batch{
+			Index:   i,
+			Entries: make([]embedder.BatchEntry, len(batch.Entries)),
+		}
+		copy(reindexed[i].Entries, batch.Entries)
+	}
+	return reindexed
+}
+
+func batchSizeTotal(batches []embedder.Batch) int {
+	total := 0
+	for _, batch := range batches {
+		total += len(batch.Entries)
+	}
+	return total
+}
+
+func (idx *Indexer) startBatchEmbedWorker(
+	ctx context.Context,
+	batchEmb embedder.BatchEmbedder,
+	requestCh <-chan batchWindowRequest,
+	resultCh chan<- batchWindowResult,
+	discoveredChunks *atomic.Int64,
+	discoveredBatches *atomic.Int64,
+	completedChunks *atomic.Int64,
+	totalsKnown *atomic.Bool,
+	onBatchProgress BatchProgressCallback,
+) {
+	go func() {
+		for req := range requestCh {
+			baseCompleted := int(completedChunks.Load())
+			progress := func(batchIndex, totalBatches, windowCompleted, windowTotal int, retrying bool, attempt int, statusCode int) {
+				globalCompleted := baseCompleted + windowCompleted
+				completedChunks.Store(int64(globalCompleted))
+				emitBatchProgress(onBatchProgress, BatchProgressInfo{
+					BatchIndex:      req.batchOffset + batchIndex,
+					TotalBatches:    int(discoveredBatches.Load()),
+					CompletedChunks: globalCompleted,
+					TotalChunks:     int(discoveredChunks.Load()),
+					KnownTotal:      totalsKnown.Load(),
+					Retrying:        retrying,
+					Attempt:         attempt,
+					StatusCode:      statusCode,
+				})
+			}
+
+			results, err := batchEmb.EmbedBatches(ctx, req.batches, progress)
+			if err == nil {
+				completedChunks.Store(int64(baseCompleted + batchSizeTotal(req.batches)))
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case resultCh <- batchWindowResult{
+				request:   req,
+				results:   results,
+				windowErr: err,
+			}:
+			}
+		}
+	}()
+}
+
+func (idx *Indexer) saveBatchReadyFile(ctx context.Context, state *batchFileState) (int, error) {
+	return idx.savePreparedFile(ctx, state.prepared, state.prepared.chunkInfos, state.vectors)
+}
+
+func (idx *Indexer) indexAllBatchPipeline(
+	ctx context.Context,
+	snapshots map[string]store.DocumentSnapshot,
+	remainingDocs map[string]bool,
+	counters *indexPipelineCounters,
+	onProgress ProgressCallback,
+	onBatchProgress BatchProgressCallback,
+	batchEmb embedder.BatchEmbedder,
+) error {
+	workers := scanWorkerCount()
+	scanTasks := make(chan fileScanTask, workers*pipelineBufferFactor)
+	preparedCh := make(chan *preparedFile, workers*pipelineBufferFactor)
+	walkErrCh := make(chan error, 1)
+	requestCh := make(chan batchWindowRequest, 1)
+	resultCh := make(chan batchWindowResult, 1)
+
+	go func() {
+		defer close(scanTasks)
+		walkErrCh <- idx.walkScanTasks(ctx, snapshots, remainingDocs, counters, onProgress, scanTasks)
+	}()
+
+	workerWG := idx.startPrepareWorkers(ctx, workers, scanTasks, preparedCh, counters)
+	go func() {
+		workerWG.Wait()
+		close(preparedCh)
+	}()
+
+	limits := embedder.DefaultBatchLimits
+	if limiter, ok := batchEmb.(embedder.BatchLimiter); ok {
+		limits = limiter.BatchLimits()
+	}
+	builder := embedder.NewIncrementalBatchBuilder(limits)
+
+	var (
+		discoveredChunks  atomic.Int64
+		discoveredBatches atomic.Int64
+		completedChunks   atomic.Int64
+		totalsKnown       atomic.Bool
+	)
+	idx.startBatchEmbedWorker(ctx, batchEmb, requestCh, resultCh, &discoveredChunks, &discoveredBatches, &completedChunks, &totalsKnown, onBatchProgress)
+
+	pendingFiles := make(map[int]*batchFileState)
+	windowQueue := make([]embedder.Batch, 0, batchWindowSize)
+	windowInFlight := false
+	preparedOpen := true
+	nextFileID := 0
+	nextBatchOffset := 0
+	nextWindowIndex := 0
+	ticker := time.NewTicker(batchFlushInterval)
+	defer ticker.Stop()
+
+	dispatchWindow := func(force bool) error {
+		if windowInFlight || len(windowQueue) == 0 {
+			return nil
+		}
+		if !force && len(windowQueue) < batchWindowSize {
+			return nil
+		}
+
+		windowSize := len(windowQueue)
+		if windowSize > batchWindowSize {
+			windowSize = batchWindowSize
+		}
+
+		windowBatches := reindexBatches(windowQueue[:windowSize])
+		req := batchWindowRequest{
+			windowIndex: nextWindowIndex,
+			batches:     windowBatches,
+			batchOffset: nextBatchOffset,
+		}
+		nextWindowIndex++
+		nextBatchOffset += len(windowBatches)
+		windowQueue = windowQueue[windowSize:]
+		windowInFlight = true
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case requestCh <- req:
+			return nil
+		}
+	}
+
+	for preparedOpen || windowInFlight || len(windowQueue) > 0 || len(pendingFiles) > 0 {
+		select {
+		case prepared, ok := <-preparedCh:
+			if !ok {
+				preparedOpen = false
+				ready := builder.Flush()
+				if len(ready) > 0 {
+					discoveredBatches.Add(int64(len(ready)))
+					windowQueue = append(windowQueue, ready...)
+				}
+				totalsKnown.Store(true)
+				if discoveredChunks.Load() > 0 {
+					emitBatchProgress(onBatchProgress, BatchProgressInfo{
+						CompletedChunks: int(completedChunks.Load()),
+						TotalChunks:     int(discoveredChunks.Load()),
+						TotalBatches:    int(discoveredBatches.Load()),
+						KnownTotal:      true,
+					})
+				}
+				if err := dispatchWindow(true); err != nil {
+					close(requestCh)
+					return err
+				}
+				continue
+			}
+
+			discoveredChunks.Add(int64(len(prepared.uncachedChunks)))
+			emitBatchProgress(onBatchProgress, BatchProgressInfo{
+				CompletedChunks: int(completedChunks.Load()),
+				TotalChunks:     int(discoveredChunks.Load()),
+				TotalBatches:    int(discoveredBatches.Load()),
+				KnownTotal:      false,
+			})
+
+			if len(prepared.chunkInfos) == 0 {
+				if err := idx.deleteExistingChunks(ctx, prepared.file.Path, prepared.existingChunkCnt); err != nil {
+					log.Printf("Failed to index %s: %v", prepared.file.Path, err)
+				}
+				continue
+			}
+
+			if len(prepared.uncachedChunks) == 0 {
+				vectors := make([][]float32, len(prepared.chunkInfos))
+				for i := range prepared.chunkInfos {
+					vectors[i] = prepared.cachedVectors[i]
+				}
+				chunksCreated, err := idx.savePreparedFile(ctx, prepared, prepared.chunkInfos, vectors)
+				if err != nil {
+					log.Printf("Failed to index %s: %v", prepared.file.Path, err)
+					continue
+				}
+				if chunksCreated > 0 {
+					counters.filesIndexed.Add(1)
+					counters.chunksCreated.Add(int64(chunksCreated))
+				}
+				continue
+			}
+
+			fileID := nextFileID
+			nextFileID++
+			state := &batchFileState{
+				prepared:  prepared,
+				vectors:   make([][]float32, len(prepared.chunkInfos)),
+				remaining: len(prepared.uncachedChunks),
+			}
+			for i, vec := range prepared.cachedVectors {
+				state.vectors[i] = vec
+			}
+			pendingFiles[fileID] = state
+
+			for i, chunk := range prepared.uncachedChunks {
+				ready := builder.Add(embedder.BatchEntry{
+					FileIndex:  fileID,
+					ChunkIndex: prepared.uncachedIndices[i],
+					Content:    chunk.Content,
+				})
+				if len(ready) > 0 {
+					discoveredBatches.Add(int64(len(ready)))
+					windowQueue = append(windowQueue, ready...)
+				}
+			}
+
+			if err := dispatchWindow(false); err != nil {
+				close(requestCh)
+				return err
+			}
+
+		case result := <-resultCh:
+			windowInFlight = false
+			if result.windowErr != nil {
+				close(requestCh)
+				return fmt.Errorf("failed to embed batches: %w", result.windowErr)
+			}
+
+			for _, batchResult := range result.results {
+				batch := result.request.batches[batchResult.BatchIndex]
+				for i, entry := range batch.Entries {
+					if i >= len(batchResult.Embeddings) {
+						continue
+					}
+					state, ok := pendingFiles[entry.FileIndex]
+					if !ok {
+						continue
+					}
+					state.vectors[entry.ChunkIndex] = batchResult.Embeddings[i]
+					state.remaining--
+					if state.remaining == 0 {
+						chunksCreated, err := idx.saveBatchReadyFile(ctx, state)
+						if err != nil {
+							close(requestCh)
+							return err
+						}
+						if chunksCreated > 0 {
+							counters.filesIndexed.Add(1)
+							counters.chunksCreated.Add(int64(chunksCreated))
+						}
+						delete(pendingFiles, entry.FileIndex)
+					}
+				}
+			}
+
+			if err := dispatchWindow(!preparedOpen); err != nil {
+				close(requestCh)
+				return err
+			}
+
+		case <-ticker.C:
+			ready := builder.Flush()
+			if len(ready) > 0 {
+				discoveredBatches.Add(int64(len(ready)))
+				windowQueue = append(windowQueue, ready...)
+			}
+			if err := dispatchWindow(true); err != nil {
+				close(requestCh)
+				return err
+			}
+		}
+	}
+
+	close(requestCh)
+	walkErr := <-walkErrCh
+	if discoveredChunks.Load() > 0 {
+		emitBatchProgress(onBatchProgress, BatchProgressInfo{
+			CompletedChunks: int(completedChunks.Load()),
+			TotalChunks:     int(discoveredChunks.Load()),
+			TotalBatches:    int(discoveredBatches.Load()),
+			KnownTotal:      true,
+		})
+	}
+	if walkErr != nil {
+		return fmt.Errorf("failed to scan files: %w", walkErr)
+	}
+	return nil
 }
 
 // fileChunkData holds chunking information for a single file during batch processing.
@@ -307,6 +954,7 @@ func wrapBatchProgress(onProgress BatchProgressCallback) embedder.BatchProgress 
 			TotalBatches:    totalBatches,
 			CompletedChunks: completedChunks,
 			TotalChunks:     totalChunks,
+			KnownTotal:      true,
 			Retrying:        retrying,
 			Attempt:         attempt,
 			StatusCode:      statusCode,

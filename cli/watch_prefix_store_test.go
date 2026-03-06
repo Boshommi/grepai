@@ -21,6 +21,7 @@ type mockVectorStore struct {
 	savedDocument         store.Document
 	deletedDocumentPath   string
 	listDocumentsResult   []string
+	listSnapshotsResult   []store.DocumentSnapshot
 	getStatsResult        *store.IndexStats
 	listFilesResult       []store.FileStats
 	getChunksForFilePath  string
@@ -62,6 +63,10 @@ func (m *mockVectorStore) DeleteDocument(_ context.Context, filePath string) err
 
 func (m *mockVectorStore) ListDocuments(_ context.Context) ([]string, error) {
 	return m.listDocumentsResult, nil
+}
+
+func (m *mockVectorStore) ListDocumentSnapshots(_ context.Context) ([]store.DocumentSnapshot, error) {
+	return m.listSnapshotsResult, nil
 }
 
 func (m *mockVectorStore) Load(_ context.Context) error {
@@ -281,5 +286,39 @@ func TestProjectPrefixStore_PassThroughAndGetChunks(t *testing.T) {
 	}
 	if mock.getChunksForFilePath != "relative.go" {
 		t.Errorf("GetChunksForFile(rel) path = %q, want %q", mock.getChunksForFilePath, "relative.go")
+	}
+}
+
+func TestProjectPrefixStore_ListDocumentSnapshotsFiltersPrefix(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+	mock := &mockVectorStore{
+		listSnapshotsResult: []store.DocumentSnapshot{
+			{Path: "ws/proj/pkg/a.go", Hash: "a", ChunkCount: 1},
+			{Path: "ws/proj/pkg/b.go", Hash: "b", ChunkCount: 2},
+			{Path: "ws/other/pkg/c.go", Hash: "c", ChunkCount: 3},
+		},
+	}
+	wrapped := &projectPrefixStore{
+		store:         mock,
+		workspaceName: "ws",
+		projectName:   "proj",
+		projectPath:   projectRoot,
+	}
+
+	lister, ok := any(wrapped).(store.DocumentSnapshotLister)
+	if !ok {
+		t.Fatal("expected projectPrefixStore to implement DocumentSnapshotLister")
+	}
+
+	snapshots, err := lister.ListDocumentSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListDocumentSnapshots failed: %v", err)
+	}
+	if len(snapshots) != 2 {
+		t.Fatalf("snapshot count = %d, want 2", len(snapshots))
+	}
+	if snapshots[0].Path != "pkg/a.go" || snapshots[1].Path != "pkg/b.go" {
+		t.Fatalf("unexpected filtered snapshot paths: %+v", snapshots)
 	}
 }

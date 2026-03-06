@@ -19,7 +19,9 @@ type mockStore struct {
 	documents        map[string]store.Document
 	chunks           map[string]store.Chunk
 	listFilesStats   []store.FileStats
+	listSnapshots    []store.DocumentSnapshot
 	listDocsCalled   bool
+	listSnapsCalled  bool
 	getDocCalled     bool
 	saveDocCalled    bool
 	saveChunksCalled bool
@@ -104,6 +106,24 @@ func (m *mockStore) ListDocuments(ctx context.Context) ([]string, error) {
 		paths = append(paths, path)
 	}
 	return paths, nil
+}
+
+func (m *mockStore) ListDocumentSnapshots(ctx context.Context) ([]store.DocumentSnapshot, error) {
+	m.listSnapsCalled = true
+	if m.listSnapshots != nil {
+		return m.listSnapshots, nil
+	}
+
+	snapshots := make([]store.DocumentSnapshot, 0, len(m.documents))
+	for _, doc := range m.documents {
+		snapshots = append(snapshots, store.DocumentSnapshot{
+			Path:       doc.Path,
+			Hash:       doc.Hash,
+			ModTime:    doc.ModTime,
+			ChunkCount: len(doc.ChunkIDs),
+		})
+	}
+	return snapshots, nil
 }
 
 func (m *mockStore) Load(ctx context.Context) error {
@@ -454,10 +474,14 @@ func TestIndexAllWithProgress_DeletedFilesRemoved(t *testing.T) {
 type mockBatchEmbedder struct {
 	embedCalled bool
 	delay       time.Duration // Optional delay per batch for testing concurrency
+	limits      embedder.BatchLimits
+	started     chan struct{}
 }
 
 func newMockBatchEmbedder() *mockBatchEmbedder {
-	return &mockBatchEmbedder{}
+	return &mockBatchEmbedder{
+		limits: embedder.DefaultBatchLimits,
+	}
 }
 
 func (m *mockBatchEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
@@ -482,8 +506,22 @@ func (m *mockBatchEmbedder) Close() error {
 	return nil
 }
 
+func (m *mockBatchEmbedder) BatchLimits() embedder.BatchLimits {
+	if m.limits.MaxSize == 0 {
+		return embedder.DefaultBatchLimits
+	}
+	return m.limits
+}
+
 func (m *mockBatchEmbedder) EmbedBatches(ctx context.Context, batches []embedder.Batch, progress embedder.BatchProgress) ([]embedder.BatchResult, error) {
 	m.embedCalled = true
+	if m.started != nil {
+		select {
+		case <-m.started:
+		default:
+			close(m.started)
+		}
+	}
 
 	// Calculate total chunks for progress reporting
 	totalChunks := 0
@@ -714,6 +752,148 @@ func TestProgressTracking_NoFilesToIndex(t *testing.T) {
 	// (batch embedder is not used when there are no chunks)
 	if progressCalled {
 		t.Error("progress should not be called when there are no files to index")
+	}
+}
+
+func TestIndexAllWithBatchProgress_UsesDocumentSnapshotsWithoutGetDocument(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	testFile := filepath.Join(tmpDir, "test.go")
+	content := "package main\n\nfunc main() {}\n"
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	info, err := os.Stat(testFile)
+	if err != nil {
+		t.Fatalf("failed to stat test file: %v", err)
+	}
+
+	mockStore := newMockStore()
+	mockStore.listSnapshots = []store.DocumentSnapshot{
+		{
+			Path:       "test.go",
+			Hash:       "seeded",
+			ModTime:    info.ModTime(),
+			ChunkCount: 1,
+		},
+	}
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, newMockBatchEmbedder(), chunker, scanner, time.Now().Add(time.Hour))
+
+	if _, err := indexer.IndexAllWithBatchProgress(context.Background(), nil, nil); err != nil {
+		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+	}
+
+	if !mockStore.listSnapsCalled {
+		t.Fatal("expected document snapshots to be loaded")
+	}
+	if mockStore.getDocCalled {
+		t.Fatal("expected GetDocument to be skipped when snapshots are available")
+	}
+}
+
+func TestIndexAllWithBatchProgress_NewFileDoesNotDeleteByFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	testFile := filepath.Join(tmpDir, "main.go")
+	content := "package main\n\nfunc main() {}\n"
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	mockStore := newMockStore()
+	mockEmb := newMockBatchEmbedder()
+	mockEmb.limits = embedder.BatchLimits{MaxSize: 1, MaxTokens: 1000}
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
+
+	if _, err := indexer.IndexAllWithBatchProgress(context.Background(), nil, nil); err != nil {
+		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+	}
+
+	if mockStore.delByFileCalled {
+		t.Fatal("expected brand-new files to skip DeleteByFile")
+	}
+}
+
+func TestIndexAllWithBatchProgress_StartsEmbeddingBeforeScanCompletes(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+
+	scanComplete := make(chan struct{})
+	scanner.walkMetadata = func(ctx context.Context, onFile func(FileMeta) error, onSkipped func(string)) error {
+		files := []FileMeta{
+			{Path: "a.go", ModTime: time.Now().Unix()},
+			{Path: "b.go", ModTime: time.Now().Unix()},
+			{Path: "c.go", ModTime: time.Now().Unix()},
+		}
+		if err := onFile(files[0]); err != nil {
+			return err
+		}
+		time.Sleep(250 * time.Millisecond)
+		for _, meta := range files[1:] {
+			if err := onFile(meta); err != nil {
+				return err
+			}
+		}
+		close(scanComplete)
+		return nil
+	}
+	scanner.scanFile = func(relPath string) (*FileInfo, error) {
+		return &FileInfo{
+			Path:    relPath,
+			ModTime: time.Now().Unix(),
+			Hash:    relPath,
+			Content: "package main\n\nfunc main() {}\n",
+		}, nil
+	}
+
+	mockStore := newMockStore()
+	mockEmb := newMockBatchEmbedder()
+	mockEmb.limits = embedder.BatchLimits{MaxSize: 1, MaxTokens: 1000}
+	mockEmb.started = make(chan struct{})
+
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := indexer.IndexAllWithBatchProgress(context.Background(), nil, nil)
+		errCh <- err
+	}()
+
+	select {
+	case <-mockEmb.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected embedding to start")
+	}
+
+	select {
+	case <-scanComplete:
+		t.Fatal("scan completed before embedding started")
+	default:
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
 	}
 }
 

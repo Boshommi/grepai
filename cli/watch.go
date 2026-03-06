@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/Boshommi/grepai/config"
 	"github.com/Boshommi/grepai/daemon"
 	"github.com/Boshommi/grepai/embedder"
@@ -25,6 +24,7 @@ import (
 	"github.com/Boshommi/grepai/store"
 	"github.com/Boshommi/grepai/trace"
 	"github.com/Boshommi/grepai/watcher"
+	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -43,6 +43,7 @@ var (
 	watchForegroundRunner      = runWatchForeground
 	watchForegroundUIRunner    = runWatchForegroundUI
 	watchStopDaemonRunner      = stopWatchDaemon
+	watchEmbedderFactory       = embedder.NewFromConfig
 )
 
 var watchCmd = &cobra.Command{
@@ -408,27 +409,20 @@ func startBackgroundWatch(logDir, worktreeID string) error {
 }
 
 func initializeEmbedder(ctx context.Context, cfg *config.Config) (embedder.Embedder, error) {
-	emb, err := embedder.NewFromConfig(cfg)
+	emb, err := watchEmbedderFactory(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	type pinger interface {
-		Ping(ctx context.Context) error
-	}
-
-	switch cfg.Embedder.Provider {
-	case "ollama":
-		if p, ok := emb.(pinger); ok {
-			if err := p.Ping(ctx); err != nil {
-				return nil, fmt.Errorf("cannot connect to Ollama: %w\nMake sure Ollama is running and has the %s model", err, cfg.Embedder.Model)
-			}
-		}
-	case "lmstudio":
-		if p, ok := emb.(pinger); ok {
-			if err := p.Ping(ctx); err != nil {
-				return nil, fmt.Errorf("cannot connect to LM Studio: %w\nMake sure LM Studio is running with the %s model loaded", err, cfg.Embedder.Model)
-			}
+	if _, err := emb.Embed(ctx, "grepai preflight"); err != nil {
+		_ = emb.Close()
+		switch cfg.Embedder.Provider {
+		case "ollama":
+			return nil, fmt.Errorf("cannot connect to Ollama: %w\nMake sure Ollama is running and has the %s model", err, cfg.Embedder.Model)
+		case "lmstudio":
+			return nil, fmt.Errorf("cannot connect to LM Studio: %w\nMake sure LM Studio is running with the %s model loaded", err, cfg.Embedder.Model)
+		default:
+			return nil, fmt.Errorf("embedding preflight failed for %s (%s): %w", cfg.Embedder.Provider, cfg.Embedder.Model, err)
 		}
 	}
 
@@ -754,7 +748,7 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 				if onScan != nil {
 					onScan(info.Current, info.Total, info.CurrentFile)
 				} else {
-					printProgress(info.Current, info.Total, info.CurrentFile)
+					printProgress(info)
 				}
 			},
 			func(info indexer.BatchProgressInfo) {
@@ -2144,28 +2138,27 @@ func isTracedLanguage(ext string, enabledLanguages []string) bool {
 }
 
 // printProgress displays a progress bar for indexing
-func printProgress(current, total int, filePath string) {
-	if total == 0 {
+func printProgress(info indexer.ProgressInfo) {
+	if info.KnownTotal && info.Total == 0 {
 		return
 	}
 
-	// Calculate percentage
-	percent := float64(current) / float64(total) * 100
-
-	// Build progress bar (20 chars width)
-	barWidth := 20
-	filled := int(float64(barWidth) * float64(current) / float64(total))
-	bar := strings.Repeat("\u2588", filled) + strings.Repeat("\u2591", barWidth-filled)
-
-	// Truncate file path if too long
 	maxPathLen := 35
-	displayPath := filePath
-	if len(filePath) > maxPathLen {
-		displayPath = "..." + filePath[len(filePath)-maxPathLen+3:]
+	displayPath := info.CurrentFile
+	if len(displayPath) > maxPathLen {
+		displayPath = "..." + displayPath[len(displayPath)-maxPathLen+3:]
 	}
 
-	// Print with carriage return to overwrite previous line
-	fmt.Printf("\rIndexing [%s] %3.0f%% (%d/%d) %s", bar, percent, current, total, displayPath)
+	if !info.KnownTotal || info.Total == 0 {
+		fmt.Printf("\rScanning (%d discovered) %s", info.Current, displayPath)
+		return
+	}
+
+	percent := float64(info.Current) / float64(info.Total) * 100
+	barWidth := 20
+	filled := int(float64(barWidth) * float64(info.Current) / float64(info.Total))
+	bar := strings.Repeat("\u2588", filled) + strings.Repeat("\u2591", barWidth-filled)
+	fmt.Printf("\rIndexing [%s] %3.0f%% (%d/%d) %s", bar, percent, info.Current, info.Total, displayPath)
 }
 
 func printBatchProgress(info indexer.BatchProgressInfo) {
@@ -2173,6 +2166,8 @@ func printBatchProgress(info indexer.BatchProgressInfo) {
 		fmt.Printf("\r%s\r", strings.Repeat(" ", 80))
 		reason := describeRetryReason(info.StatusCode)
 		fmt.Printf("%s - Retrying batch %d (attempt %d/5)...\n", reason, info.BatchIndex+1, info.Attempt)
+	} else if !info.KnownTotal {
+		fmt.Printf("\rEmbedding (%d/%d discovered)", info.CompletedChunks, info.TotalChunks)
 	} else if info.TotalChunks > 0 {
 		percentage := float64(info.CompletedChunks) / float64(info.TotalChunks) * 100
 		barWidth := 20
@@ -2806,6 +2801,30 @@ func (p *projectPrefixStore) DeleteDocument(ctx context.Context, filePath string
 
 func (p *projectPrefixStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return p.store.ListDocuments(ctx)
+}
+
+func (p *projectPrefixStore) ListDocumentSnapshots(ctx context.Context) ([]store.DocumentSnapshot, error) {
+	lister, ok := p.store.(store.DocumentSnapshotLister)
+	if !ok {
+		return nil, nil
+	}
+
+	snapshots, err := lister.ListDocumentSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix := p.getPrefix() + "/"
+	filtered := make([]store.DocumentSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if !strings.HasPrefix(snapshot.Path, prefix) {
+			continue
+		}
+		snapshot.Path = strings.TrimPrefix(snapshot.Path, prefix)
+		filtered = append(filtered, snapshot)
+	}
+
+	return filtered, nil
 }
 
 func (p *projectPrefixStore) Load(ctx context.Context) error {

@@ -176,6 +176,62 @@ type BatchResult struct {
 	Embeddings [][]float32
 }
 
+// IncrementalBatchBuilder forms batches incrementally as chunks arrive from a
+// streaming scan/indexing pipeline.
+type IncrementalBatchBuilder struct {
+	builder *batchBuilder
+}
+
+func NewIncrementalBatchBuilder(limits BatchLimits) *IncrementalBatchBuilder {
+	if limits.MaxSize <= 0 {
+		limits = DefaultBatchLimits
+	}
+	return &IncrementalBatchBuilder{
+		builder: newBatchBuilder(1, limits),
+	}
+}
+
+// Add appends a single entry and returns any batches that became ready.
+func (b *IncrementalBatchBuilder) Add(entry BatchEntry) []Batch {
+	if b == nil {
+		return nil
+	}
+	tokens := estimateTokensWithRatio(entry.Content, b.builder.limits.charsPerToken())
+	if b.builder.isFull(tokens) {
+		b.builder.finalizeCurrent()
+	}
+	b.builder.current.Entries = append(b.builder.current.Entries, entry)
+	b.builder.currentTokens += tokens
+
+	if len(b.builder.batches) == 0 {
+		return nil
+	}
+
+	ready := make([]Batch, len(b.builder.batches))
+	copy(ready, b.builder.batches)
+	b.builder.batches = b.builder.batches[:0]
+	return ready
+}
+
+// Flush finalizes the current partially-filled batch, if any, and returns all
+// ready batches accumulated since the last Add/Flush call.
+func (b *IncrementalBatchBuilder) Flush() []Batch {
+	if b == nil {
+		return nil
+	}
+	if len(b.builder.current.Entries) > 0 {
+		b.builder.finalizeCurrent()
+	}
+	if len(b.builder.batches) == 0 {
+		return nil
+	}
+
+	ready := make([]Batch, len(b.builder.batches))
+	copy(ready, b.builder.batches)
+	b.builder.batches = b.builder.batches[:0]
+	return ready
+}
+
 // MapResultsToFiles maps batch results back to per-file embeddings.
 // Returns a slice where each index corresponds to a file, containing embeddings for that file's chunks.
 func MapResultsToFiles(batches []Batch, results []BatchResult, numFiles int) [][][]float32 {

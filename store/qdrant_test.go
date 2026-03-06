@@ -283,6 +283,26 @@ func TestBuildChunkPayload(t *testing.T) {
 	}
 }
 
+func TestBuildAndParseQdrantDocumentPayload(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	payload, err := buildQdrantDocumentPayload(Document{
+		Path:    "test.go",
+		Hash:    "doc-hash",
+		ModTime: now,
+	})
+	if err != nil {
+		t.Fatalf("buildQdrantDocumentPayload failed: %v", err)
+	}
+
+	hash, modTime := parseQdrantDocumentMetadata(payload)
+	if hash != "doc-hash" {
+		t.Fatalf("hash = %q, want %q", hash, "doc-hash")
+	}
+	if !modTime.Equal(now) {
+		t.Fatalf("modTime = %v, want %v", modTime, now)
+	}
+}
+
 // TestSearch_InvalidLimit tests that Search returns error for invalid limits
 func TestSearch_InvalidLimit(t *testing.T) {
 	store := &QdrantStore{

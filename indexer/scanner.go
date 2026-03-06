@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -112,8 +113,10 @@ type FileMeta struct {
 }
 
 type Scanner struct {
-	root   string
-	ignore *IgnoreMatcher
+	root         string
+	ignore       *IgnoreMatcher
+	walkMetadata func(ctx context.Context, onFile func(FileMeta) error, onSkipped func(string)) error
+	scanFile     func(relPath string) (*FileInfo, error)
 }
 
 func NewScanner(root string, ignore *IgnoreMatcher) *Scanner {
@@ -123,15 +126,23 @@ func NewScanner(root string, ignore *IgnoreMatcher) *Scanner {
 	}
 }
 
-// ScanMetadata scans indexable files and returns only file metadata.
-// It avoids reading file contents and hash computation for a faster first pass.
-func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
-	var files []FileMeta
-	var skipped []string
+// WalkMetadata scans indexable files incrementally and invokes callbacks as
+// files are discovered. It avoids reading file contents and hash computation.
+func (s *Scanner) WalkMetadata(ctx context.Context, onFile func(FileMeta) error, onSkipped func(string)) error {
+	if s.walkMetadata != nil {
+		return s.walkMetadata(ctx, onFile, onSkipped)
+	}
 
-	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
+	return filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // Skip files we can't access
+		}
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 		}
 
 		relPath, err := filepath.Rel(s.root, path)
@@ -139,28 +150,26 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 			return nil
 		}
 
-		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
 		if d.IsDir() {
 			if s.ignore.ShouldSkipDir(relPath) {
 				return filepath.SkipDir
 			}
-			return nil // Descend into the directory
+			return nil
 		}
 
-		// Skip ignored files
 		if s.ignore.ShouldIgnore(relPath) {
 			return nil
 		}
 
-		// Check extension
 		ext := strings.ToLower(filepath.Ext(path))
 		if !SupportedExtensions[ext] {
 			return nil
 		}
 
-		// Skip minified files
 		if isMinifiedFile(relPath) {
-			skipped = append(skipped, relPath+" (minified)")
+			if onSkipped != nil {
+				onSkipped(relPath + " (minified)")
+			}
 			return nil
 		}
 
@@ -168,20 +177,35 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 		if err != nil {
 			return nil
 		}
-
-		// Skip large files
 		if info.Size() > maxFileSize {
-			skipped = append(skipped, relPath+" (too large)")
+			if onSkipped != nil {
+				onSkipped(relPath + " (too large)")
+			}
 			return nil
 		}
 
-		files = append(files, FileMeta{
-			Path:    relPath,
-			Size:    info.Size(),
-			ModTime: info.ModTime().Unix(),
-		})
-
+		if onFile != nil {
+			return onFile(FileMeta{
+				Path:    relPath,
+				Size:    info.Size(),
+				ModTime: info.ModTime().Unix(),
+			})
+		}
 		return nil
+	})
+}
+
+// ScanMetadata scans indexable files and returns only file metadata.
+// It avoids reading file contents and hash computation for a faster first pass.
+func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
+	var files []FileMeta
+	var skipped []string
+
+	err := s.WalkMetadata(context.Background(), func(meta FileMeta) error {
+		files = append(files, meta)
+		return nil
+	}, func(reason string) {
+		skipped = append(skipped, reason)
 	})
 
 	return files, skipped, err
@@ -266,6 +290,10 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 }
 
 func (s *Scanner) ScanFile(relPath string) (*FileInfo, error) {
+	if s.scanFile != nil {
+		return s.scanFile(relPath)
+	}
+
 	absPath := filepath.Join(s.root, relPath)
 
 	// Skip minified files

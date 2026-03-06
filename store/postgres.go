@@ -258,6 +258,30 @@ func (s *PostgresStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return paths, rows.Err()
 }
 
+func (s *PostgresStore) ListDocumentSnapshots(ctx context.Context) ([]DocumentSnapshot, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT path, hash, mod_time, COALESCE(array_length(chunk_ids, 1), 0)
+		FROM documents
+		WHERE project_id = $1`,
+		s.projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list document snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var snapshots []DocumentSnapshot
+	for rows.Next() {
+		var snapshot DocumentSnapshot
+		if err := rows.Scan(&snapshot.Path, &snapshot.Hash, &snapshot.ModTime, &snapshot.ChunkCount); err != nil {
+			return nil, fmt.Errorf("failed to scan document snapshot: %w", err)
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+
+	return snapshots, rows.Err()
+}
+
 func (s *PostgresStore) Load(ctx context.Context) error {
 	// No-op for Postgres, data is already persistent
 	return nil
