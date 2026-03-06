@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"regexp"
@@ -22,7 +23,7 @@ const (
 	lmStudioNomicDimensions    = 768
 	defaultLMStudioParallelism = 1
 	defaultLMStudioTimeout     = 5 * time.Minute
-	lmStudioMaxAttempts        = 3
+	lmStudioMaxAttempts        = 5
 	lmStudioRetryBaseDelay     = 750 * time.Millisecond
 )
 
@@ -134,14 +135,16 @@ func (e *LMStudioEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 		if err == nil {
 			return embeddings, nil
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-			return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		lastErr = err
 		if !retryable || attempt == lmStudioMaxAttempts {
 			return nil, err
 		}
-		if err := sleepWithContext(ctx, lmStudioRetryDelay(attempt)); err != nil {
+		delay := lmStudioRetryDelay(attempt)
+		log.Printf("LM Studio transient embedding failure (attempt %d/%d), retrying in %s: %v", attempt, lmStudioMaxAttempts, delay, err)
+		if err := sleepWithContext(ctx, delay); err != nil {
 			return nil, err
 		}
 	}

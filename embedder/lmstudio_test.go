@@ -61,6 +61,13 @@ func (timeoutError) Error() string   { return "timeout" }
 func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
 
+type deadlineTimeoutError struct{}
+
+func (deadlineTimeoutError) Error() string   { return "context deadline exceeded (Client.Timeout exceeded while awaiting headers)" }
+func (deadlineTimeoutError) Timeout() bool   { return true }
+func (deadlineTimeoutError) Temporary() bool { return true }
+func (deadlineTimeoutError) Unwrap() error   { return context.DeadlineExceeded }
+
 func (s *scriptedLMStudioTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -269,6 +276,24 @@ func TestLMStudioEmbedder_RetriesTransientTimeout(t *testing.T) {
 	}
 	if emb.rateLimiter.CurrentWorkers() != 2 {
 		t.Fatalf("CurrentWorkers after timeout = %d, want 2", emb.rateLimiter.CurrentWorkers())
+	}
+}
+
+func TestLMStudioEmbedder_RetriesWrappedDeadlineTimeout(t *testing.T) {
+	transport := &scriptedLMStudioTransport{
+		steps: []scriptedLMStudioStep{
+			{err: deadlineTimeoutError{}},
+		},
+	}
+
+	emb := NewLMStudioEmbedder(WithLMStudioParallelism(4))
+	emb.client = &http.Client{Transport: transport}
+
+	if _, err := emb.EmbedBatch(context.Background(), []string{"hello"}); err != nil {
+		t.Fatalf("expected retry to recover from wrapped deadline timeout, got %v", err)
+	}
+	if emb.rateLimiter.CurrentWorkers() != 2 {
+		t.Fatalf("CurrentWorkers after wrapped deadline timeout = %d, want 2", emb.rateLimiter.CurrentWorkers())
 	}
 }
 
