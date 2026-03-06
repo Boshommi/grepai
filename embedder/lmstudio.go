@@ -21,6 +21,9 @@ const (
 	defaultLMStudioModel       = "text-embedding-nomic-embed-text-v1.5"
 	lmStudioNomicDimensions    = 768
 	defaultLMStudioParallelism = 1
+	defaultLMStudioTimeout     = 5 * time.Minute
+	lmStudioMaxAttempts        = 3
+	lmStudioRetryBaseDelay     = 750 * time.Millisecond
 )
 
 var (
@@ -95,7 +98,7 @@ func NewLMStudioEmbedder(opts ...LMStudioOption) *LMStudioEmbedder {
 		dimensions:  lmStudioNomicDimensions,
 		parallelism: defaultLMStudioParallelism,
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: defaultLMStudioTimeout,
 		},
 		notifyCh: make(chan struct{}, 1),
 	}
@@ -121,77 +124,29 @@ func (e *LMStudioEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	if err := e.acquirePermit(ctx); err != nil {
-		return nil, err
-	}
-	defer e.releasePermit()
-
-	reqBody := lmStudioEmbedRequest{
-		Model: e.model,
-		Input: texts,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/v1/embeddings", e.endpoint)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	var lastErr error
+	for attempt := 1; attempt <= lmStudioMaxAttempts; attempt++ {
+		if err := e.acquirePermit(ctx); err != nil {
+			return nil, err
 		}
-		e.recordTransientFailure(err)
-		return nil, fmt.Errorf("failed to send request to LM Studio: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		embeddings, retryable, err := e.embedBatchOnce(ctx, texts)
+		e.releasePermit()
+		if err == nil {
+			return embeddings, nil
 		}
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		var errResp lmStudioErrorResponse
-		msg := string(body)
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
-			msg = errResp.Error.Message
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return nil, err
 		}
-
-		if ctxErr := parseLMStudioContextLengthError(msg, texts); ctxErr != nil {
-			return nil, ctxErr
+		lastErr = err
+		if !retryable || attempt == lmStudioMaxAttempts {
+			return nil, err
 		}
-		e.recordHTTPFailure(resp.StatusCode)
-
-		return nil, fmt.Errorf("LM Studio returned status %d: %s", resp.StatusCode, msg)
+		if err := sleepWithContext(ctx, lmStudioRetryDelay(attempt)); err != nil {
+			return nil, err
+		}
 	}
 
-	var result lmStudioEmbedResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(result.Data) != len(texts) {
-		return nil, fmt.Errorf("expected %d embeddings, got %d", len(texts), len(result.Data))
-	}
-
-	embeddings := make([][]float32, len(texts))
-	for _, item := range result.Data {
-		embeddings[item.Index] = item.Embedding
-	}
-	e.recordSuccess()
-
-	return embeddings, nil
+	return nil, lastErr
 }
 
 func (e *LMStudioEmbedder) Dimensions() int {
@@ -368,8 +323,119 @@ func (e *LMStudioEmbedder) recordTransientFailure(err error) {
 	if err != nil && !isLMStudioTransientTransportError(err) {
 		return
 	}
-	if e.rateLimiter.OnRateLimitHit() {
+	if e.rateLimiter.OnTransientFailure() {
 		e.signalWaiters()
+	}
+}
+
+func (e *LMStudioEmbedder) embedBatchOnce(ctx context.Context, texts []string) ([][]float32, bool, error) {
+	reqBody := lmStudioEmbedRequest{
+		Model: e.model,
+		Input: texts,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/v1/embeddings", e.endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		e.recordTransientFailure(err)
+		return nil, true, fmt.Errorf("failed to send request to LM Studio: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		if isLMStudioTransientTransportError(err) {
+			e.recordTransientFailure(err)
+			return nil, true, fmt.Errorf("failed to read response: %w", err)
+		}
+		return nil, false, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp lmStudioErrorResponse
+		msg := string(body)
+		if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
+			msg = errResp.Error.Message
+		}
+
+		if ctxErr := parseLMStudioContextLengthError(msg, texts); ctxErr != nil {
+			return nil, false, ctxErr
+		}
+
+		retryable := isLMStudioRetryableStatus(resp.StatusCode)
+		if retryable {
+			e.recordHTTPFailure(resp.StatusCode)
+		}
+
+		return nil, retryable, fmt.Errorf("LM Studio returned status %d: %s", resp.StatusCode, msg)
+	}
+
+	var result lmStudioEmbedResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, false, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if len(result.Data) != len(texts) {
+		return nil, false, fmt.Errorf("expected %d embeddings, got %d", len(texts), len(result.Data))
+	}
+
+	embeddings := make([][]float32, len(texts))
+	for _, item := range result.Data {
+		embeddings[item.Index] = item.Embedding
+	}
+	e.recordSuccess()
+
+	return embeddings, false, nil
+}
+
+func isLMStudioRetryableStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
+}
+
+func lmStudioRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := lmStudioRetryBaseDelay << (attempt - 1)
+	maxDelay := 5 * time.Second
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

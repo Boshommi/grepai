@@ -213,18 +213,14 @@ func TestLMStudioEmbedder_ReducesAndRestoresParallelismOnTransientOverload(t *te
 	transport := &scriptedLMStudioTransport{
 		steps: []scriptedLMStudioStep{
 			{status: http.StatusServiceUnavailable, body: `{"error":{"message":"busy"}}`},
-			{status: http.StatusServiceUnavailable, body: `{"error":{"message":"busy"}}`},
-			{status: http.StatusServiceUnavailable, body: `{"error":{"message":"busy"}}`},
 		},
 	}
 
 	emb := NewLMStudioEmbedder(WithLMStudioParallelism(4))
 	emb.client = &http.Client{Transport: transport}
 
-	for i := 0; i < 3; i++ {
-		if _, err := emb.EmbedBatch(context.Background(), []string{"hello"}); err == nil {
-			t.Fatal("expected transient overload error")
-		}
+	if _, err := emb.EmbedBatch(context.Background(), []string{"hello"}); err != nil {
+		t.Fatalf("expected retry to recover from transient overload, got %v", err)
 	}
 	if emb.rateLimiter.CurrentWorkers() != 2 {
 		t.Fatalf("CurrentWorkers after overload = %d, want 2", emb.rateLimiter.CurrentWorkers())
@@ -244,21 +240,35 @@ func TestLMStudioEmbedder_TransportEOFReducesParallelism(t *testing.T) {
 	transport := &scriptedLMStudioTransport{
 		steps: []scriptedLMStudioStep{
 			{err: io.EOF},
-			{err: io.EOF},
-			{err: io.EOF},
 		},
 	}
 
 	emb := NewLMStudioEmbedder(WithLMStudioParallelism(4))
 	emb.client = &http.Client{Transport: transport}
 
-	for i := 0; i < 3; i++ {
-		if _, err := emb.EmbedBatch(context.Background(), []string{"hello"}); err == nil {
-			t.Fatal("expected transport error")
-		}
+	if _, err := emb.EmbedBatch(context.Background(), []string{"hello"}); err != nil {
+		t.Fatalf("expected retry to recover from EOF, got %v", err)
 	}
 	if emb.rateLimiter.CurrentWorkers() != 2 {
 		t.Fatalf("CurrentWorkers after EOF failures = %d, want 2", emb.rateLimiter.CurrentWorkers())
+	}
+}
+
+func TestLMStudioEmbedder_RetriesTransientTimeout(t *testing.T) {
+	transport := &scriptedLMStudioTransport{
+		steps: []scriptedLMStudioStep{
+			{err: timeoutError{}},
+		},
+	}
+
+	emb := NewLMStudioEmbedder(WithLMStudioParallelism(4))
+	emb.client = &http.Client{Transport: transport}
+
+	if _, err := emb.EmbedBatch(context.Background(), []string{"hello"}); err != nil {
+		t.Fatalf("expected retry to recover from timeout, got %v", err)
+	}
+	if emb.rateLimiter.CurrentWorkers() != 2 {
+		t.Fatalf("CurrentWorkers after timeout = %d, want 2", emb.rateLimiter.CurrentWorkers())
 	}
 }
 

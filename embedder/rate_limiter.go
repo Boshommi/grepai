@@ -164,6 +164,15 @@ func (arl *AdaptiveRateLimiter) OnRateLimitHit() bool {
 	return false
 }
 
+// OnTransientFailure should be called when a provider overloads locally
+// or transport-level instability suggests the current concurrency is too high.
+// It immediately reduces parallelism and resets the success streak.
+func (arl *AdaptiveRateLimiter) OnTransientFailure() bool {
+	arl.successStreak.Store(0)
+	arl.rateLimitHits.Store(0)
+	return arl.reduceParallelism()
+}
+
 // reduceParallelism halves the current parallelism level, never going below 1.
 // Returns true if parallelism was actually reduced.
 func (arl *AdaptiveRateLimiter) reduceParallelism() bool {
